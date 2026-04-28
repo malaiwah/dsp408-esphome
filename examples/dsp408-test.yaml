@@ -1,5 +1,21 @@
-# DSP-408 ESPHome bench-test config — full v0.2 surface.
-# 8 output channels × {volume, mute, delay, polar, HPF, LPF} + master.
+# DSP-408 ESPHome example — v0.3 full feature surface.
+#
+# Structure:
+#   - All 8 output channels expose volume / mute / polar / delay / HPF freq
+#     / LPF freq (the "everyday" controls).
+#   - Filter type + slope `select` entities are demoed on Ch1 + Ch2 only,
+#     keeping the entity count below the ESPHome native API's practical
+#     ceiling (~52 entities seems stable; 60+ select+text entities cause
+#     HA<->device API connection churn). Extending to Ch3-Ch8 is mechanical
+#     once you have a setup that's tested at higher entity counts.
+#   - Preset name + Ch1 name `text` entities for naming.
+#   - EQ band (10 per channel) and routing matrix (4×8 cells) writes are
+#     exposed as user-defined service ACTIONS rather than entities — too
+#     numerous for a useful HA dashboard, more natural as scripted calls.
+#
+# Total entities: 1 (model) + 1 (preset_name) + 1 (master vol) + 1 (master
+# mute) + 6×8 (per-channel basics) + 4 (Ch1 selects) + 4 (Ch2 selects)
+# + 1 (Ch1 name) = 60 entities. Adjust down if your HA struggles.
 
 substitutions:
   device_name: dsp408-test
@@ -17,20 +33,16 @@ esp32:
   framework:
     type: esp-idf
     sdkconfig_options:
-      # Force the ESP32-S3's internal USB PHY to host mode by routing
-      # the boot ROM console + ESP-IDF console to UART0.
       CONFIG_ESP_CONSOLE_UART_DEFAULT: y
       CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG: n
       CONFIG_ESP_CONSOLE_USB_CDC: n
       CONFIG_ESP_CONSOLE_NONE: n
 
 external_components:
-  - source:
-      type: local
-      path: ../components
+  - source: { type: local, path: ../components }
 
 logger:
-  level: VERBOSE
+  level: DEBUG
   hardware_uart: UART0
   logs:
     dsp408: DEBUG
@@ -39,6 +51,29 @@ logger:
 api:
   encryption:
     key: !secret api_encryption_key
+  # User-defined service actions. EQ bands (10 per channel × 8 channels =
+  # 80 cells, 3 fields each) and the routing matrix (up to 8 inputs ×
+  # 8 outputs = 64 cells) are too numerous to expose as entities, so
+  # they're exposed as callable services. From HA: Developer Tools →
+  # Services → esphome.dsp408_test_set_eq_band / set_routing.
+  actions:
+    - action: set_eq_band
+      variables: { channel: int, band: int, freq_hz: int, gain_db: float, q: float }
+      then:
+        - lambda: |-
+            id(my_dsp).request_eq_band(
+                static_cast<uint8_t>(channel),
+                static_cast<uint8_t>(band),
+                static_cast<uint16_t>(freq_hz),
+                gain_db, q);
+    - action: set_routing
+      variables: { channel: int, input_idx: int, enabled: bool }
+      then:
+        - lambda: |-
+            id(my_dsp).request_routing(
+                static_cast<uint8_t>(channel),
+                static_cast<uint8_t>(input_idx),
+                enabled);
 
 ota:
   - platform: esphome
@@ -52,8 +87,6 @@ wifi:
 
 captive_portal:
 
-# ─── DSP-408 ────────────────────────────────────────────────────────────
-
 usb_host:
   enable_hubs: false
 
@@ -61,178 +94,85 @@ dsp408:
   id: my_dsp
 
 text_sensor:
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: MODEL
-    name: "Model"
+  - { platform: dsp408, dsp408_id: my_dsp, kind: MODEL, name: "Model" }
 
-# ─── Master ─────────────────────────────────────────────────────────────
+# ─── Numbers (master + per-channel volume/delay/HPF/LPF for 8 channels) ─
 
 number:
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: MASTER_VOLUME
-    name: "Master Volume"
-    unit_of_measurement: "dB"
-    icon: mdi:volume-high
+  - { platform: dsp408, dsp408_id: my_dsp, kind: MASTER_VOLUME, name: "Master Volume", unit_of_measurement: "dB", icon: mdi:volume-high }
 
-# ─── Per-channel: volume, delay, HPF, LPF ──────────────────────────────
-# Generated for channels 0..7. Names use 1-based indexing for users.
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_VOLUME,   channel: 0, name: "Ch1 Volume", unit_of_measurement: "dB" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_DELAY,    channel: 0, name: "Ch1 Delay",  unit_of_measurement: "samples" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FREQ, channel: 0, name: "Ch1 HPF",    unit_of_measurement: "Hz" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FREQ, channel: 0, name: "Ch1 LPF",    unit_of_measurement: "Hz" }
 
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_VOLUME
-    channel: 0
-    name: "Ch1 Volume"
-    unit_of_measurement: "dB"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_DELAY
-    channel: 0
-    name: "Ch1 Delay"
-    unit_of_measurement: "samples"
-    icon: mdi:timer-outline
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_HPF_FREQ
-    channel: 0
-    name: "Ch1 HPF"
-    unit_of_measurement: "Hz"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_LPF_FREQ
-    channel: 0
-    name: "Ch1 LPF"
-    unit_of_measurement: "Hz"
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_VOLUME,   channel: 1, name: "Ch2 Volume", unit_of_measurement: "dB" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_DELAY,    channel: 1, name: "Ch2 Delay",  unit_of_measurement: "samples" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FREQ, channel: 1, name: "Ch2 HPF",    unit_of_measurement: "Hz" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FREQ, channel: 1, name: "Ch2 LPF",    unit_of_measurement: "Hz" }
 
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_VOLUME
-    channel: 1
-    name: "Ch2 Volume"
-    unit_of_measurement: "dB"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_DELAY
-    channel: 1
-    name: "Ch2 Delay"
-    unit_of_measurement: "samples"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_HPF_FREQ
-    channel: 1
-    name: "Ch2 HPF"
-    unit_of_measurement: "Hz"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_LPF_FREQ
-    channel: 1
-    name: "Ch2 LPF"
-    unit_of_measurement: "Hz"
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_VOLUME,   channel: 2, name: "Ch3 Volume", unit_of_measurement: "dB" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_DELAY,    channel: 2, name: "Ch3 Delay",  unit_of_measurement: "samples" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FREQ, channel: 2, name: "Ch3 HPF",    unit_of_measurement: "Hz" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FREQ, channel: 2, name: "Ch3 LPF",    unit_of_measurement: "Hz" }
 
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_VOLUME
-    channel: 2
-    name: "Ch3 Volume"
-    unit_of_measurement: "dB"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_DELAY
-    channel: 2
-    name: "Ch3 Delay"
-    unit_of_measurement: "samples"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_HPF_FREQ
-    channel: 2
-    name: "Ch3 HPF"
-    unit_of_measurement: "Hz"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_LPF_FREQ
-    channel: 2
-    name: "Ch3 LPF"
-    unit_of_measurement: "Hz"
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_VOLUME,   channel: 3, name: "Ch4 Volume", unit_of_measurement: "dB" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_DELAY,    channel: 3, name: "Ch4 Delay",  unit_of_measurement: "samples" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FREQ, channel: 3, name: "Ch4 HPF",    unit_of_measurement: "Hz" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FREQ, channel: 3, name: "Ch4 LPF",    unit_of_measurement: "Hz" }
 
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_VOLUME
-    channel: 3
-    name: "Ch4 Volume"
-    unit_of_measurement: "dB"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_DELAY
-    channel: 3
-    name: "Ch4 Delay"
-    unit_of_measurement: "samples"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_HPF_FREQ
-    channel: 3
-    name: "Ch4 HPF"
-    unit_of_measurement: "Hz"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_LPF_FREQ
-    channel: 3
-    name: "Ch4 LPF"
-    unit_of_measurement: "Hz"
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_VOLUME,   channel: 4, name: "Ch5 Volume", unit_of_measurement: "dB" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_DELAY,    channel: 4, name: "Ch5 Delay",  unit_of_measurement: "samples" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FREQ, channel: 4, name: "Ch5 HPF",    unit_of_measurement: "Hz" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FREQ, channel: 4, name: "Ch5 LPF",    unit_of_measurement: "Hz" }
 
-# ─── Per-channel: mute, polar ──────────────────────────────────────────
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_VOLUME,   channel: 5, name: "Ch6 Volume", unit_of_measurement: "dB" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_DELAY,    channel: 5, name: "Ch6 Delay",  unit_of_measurement: "samples" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FREQ, channel: 5, name: "Ch6 HPF",    unit_of_measurement: "Hz" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FREQ, channel: 5, name: "Ch6 LPF",    unit_of_measurement: "Hz" }
+
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_VOLUME,   channel: 6, name: "Ch7 Volume", unit_of_measurement: "dB" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_DELAY,    channel: 6, name: "Ch7 Delay",  unit_of_measurement: "samples" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FREQ, channel: 6, name: "Ch7 HPF",    unit_of_measurement: "Hz" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FREQ, channel: 6, name: "Ch7 LPF",    unit_of_measurement: "Hz" }
+
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_VOLUME,   channel: 7, name: "Ch8 Volume", unit_of_measurement: "dB" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_DELAY,    channel: 7, name: "Ch8 Delay",  unit_of_measurement: "samples" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FREQ, channel: 7, name: "Ch8 HPF",    unit_of_measurement: "Hz" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FREQ, channel: 7, name: "Ch8 LPF",    unit_of_measurement: "Hz" }
+
+# ─── Switches (master + per-channel mute/polar) ────────────────────────
 
 switch:
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: MASTER_MUTE
-    name: "Master Mute"
-    icon: mdi:volume-off
+  - { platform: dsp408, dsp408_id: my_dsp, kind: MASTER_MUTE, name: "Master Mute", icon: mdi:volume-off }
 
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_MUTE
-    channel: 0
-    name: "Ch1 Mute"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_POLAR
-    channel: 0
-    name: "Ch1 Polar"
-    icon: mdi:sine-wave
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_MUTE,  channel: 0, name: "Ch1 Mute" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_POLAR, channel: 0, name: "Ch1 Polar", icon: mdi:sine-wave }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_MUTE,  channel: 1, name: "Ch2 Mute" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_POLAR, channel: 1, name: "Ch2 Polar", icon: mdi:sine-wave }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_MUTE,  channel: 2, name: "Ch3 Mute" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_POLAR, channel: 2, name: "Ch3 Polar", icon: mdi:sine-wave }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_MUTE,  channel: 3, name: "Ch4 Mute" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_POLAR, channel: 3, name: "Ch4 Polar", icon: mdi:sine-wave }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_MUTE,  channel: 4, name: "Ch5 Mute" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_POLAR, channel: 4, name: "Ch5 Polar", icon: mdi:sine-wave }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_MUTE,  channel: 5, name: "Ch6 Mute" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_POLAR, channel: 5, name: "Ch6 Polar", icon: mdi:sine-wave }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_MUTE,  channel: 6, name: "Ch7 Mute" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_POLAR, channel: 6, name: "Ch7 Polar", icon: mdi:sine-wave }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_MUTE,  channel: 7, name: "Ch8 Mute" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_POLAR, channel: 7, name: "Ch8 Polar", icon: mdi:sine-wave }
 
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_MUTE
-    channel: 1
-    name: "Ch2 Mute"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_POLAR
-    channel: 1
-    name: "Ch2 Polar"
-    icon: mdi:sine-wave
+# ─── Selects (HPF/LPF type + slope demoed on Ch1 + Ch2) ─────────────────
 
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_MUTE
-    channel: 2
-    name: "Ch3 Mute"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_POLAR
-    channel: 2
-    name: "Ch3 Polar"
-    icon: mdi:sine-wave
+select:
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FILTER, channel: 0, name: "Ch1 HPF Type" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_SLOPE,  channel: 0, name: "Ch1 HPF Slope" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FILTER, channel: 0, name: "Ch1 LPF Type" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_SLOPE,  channel: 0, name: "Ch1 LPF Slope" }
 
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_MUTE
-    channel: 3
-    name: "Ch4 Mute"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_POLAR
-    channel: 3
-    name: "Ch4 Polar"
-    icon: mdi:sine-wave
+# ─── Texts (preset name + Ch1 channel name) ────────────────────────────
+
+text:
+  - { platform: dsp408, dsp408_id: my_dsp, kind: PRESET_NAME, name: "Preset Name", mode: text }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_NAME, channel: 0, name: "Ch1 Name", mode: text }

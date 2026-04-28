@@ -7,10 +7,13 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include "esphome/components/text_sensor/text_sensor.h"
+#include "esphome/components/text/text.h"
 #include "esphome/components/number/number.h"
 #include "esphome/components/switch/switch.h"
+#include "esphome/components/select/select.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace esphome {
 namespace dsp408 {
@@ -246,6 +249,28 @@ void DSP408::loop() {
         this->last_master_poll_ms_ = now;
         had_work = true;
       }
+      // Round-robin re-publish of ONE channel's cached state per
+      // REPUBLISH_STAGGER_MS tick. Channel state is only read on
+      // warmup; if the API client wasn't connected then (or churned
+      // its connection), entities stay 'unavailable' forever. We
+      // re-publish to make any HA reconnect see fresh state — but
+      // staggered to avoid bursting 8 × 6 entity states in one tick,
+      // which overruns the API send buffer for large surfaces.
+      if (now - this->last_republish_ms_ > REPUBLISH_STAGGER_MS) {
+        uint8_t ch = this->republish_channel_rr_;
+        if (this->ch_state_[ch].primed) {
+          this->publish_channel_state_(ch);
+        }
+        this->republish_channel_rr_ = (ch + 1) & 0x07;
+        this->last_republish_ms_ = now;
+        // Also republish preset name occasionally on the 0th channel
+        // tick so it doesn't fall through cracks.
+        if (ch == 0 && this->preset_name_known_ &&
+            this->preset_name_text_ != nullptr) {
+          this->preset_name_text_->publish_state(std::string(this->preset_name_));
+        }
+        had_work = true;
+      }
       break;
     case StartupPhase::IDLE:
     default:
@@ -367,11 +392,23 @@ void DSP408::dispatch_frame_(const InReport &report) {
       this->handle_master_reply_(f.payload, f.payload_bytes_in_frame,
                                  f.direction == DIR_WRITE_ACK);
       break;
+    case CMD_PRESET_NAME:
+      this->handle_preset_name_reply_(f.payload, f.payload_bytes_in_frame,
+                                      f.direction == DIR_WRITE_ACK);
+      break;
     default:
       if (f.cmd >= CMD_WRITE_CHANNEL_BASE && f.cmd < CMD_WRITE_CHANNEL_BASE + 8) {
         this->handle_channel_write_ack_(f.cmd, f.payload, f.payload_bytes_in_frame);
-      } else if (f.cmd >= 0x12000 && f.cmd < 0x12008) {
+      } else if (f.cmd >= CMD_WRITE_CROSSOVER_BASE && f.cmd < CMD_WRITE_CROSSOVER_BASE + 8) {
         this->handle_crossover_write_ack_(f.cmd, f.payload, f.payload_bytes_in_frame);
+      } else if (f.cmd >= CMD_ROUTING_BASE && f.cmd < CMD_ROUTING_BASE + 8) {
+        this->handle_routing_write_ack_(f.cmd, f.payload, f.payload_bytes_in_frame);
+      } else if (f.cmd >= CMD_WRITE_EQ_BAND_BASE &&
+                 f.cmd < CMD_WRITE_EQ_BAND_BASE + (10 * 0x100) + 8) {
+        this->handle_eq_band_write_ack_(f.cmd, f.payload, f.payload_bytes_in_frame);
+      } else if (f.cmd >= CMD_WRITE_CHANNEL_NAME_BASE &&
+                 f.cmd < CMD_WRITE_CHANNEL_NAME_BASE + 8) {
+        this->handle_channel_name_write_ack_(f.cmd, f.payload, f.payload_bytes_in_frame);
       } else {
         ESP_LOGV(TAG, "Unhandled cmd 0x%X", static_cast<unsigned>(f.cmd));
       }
@@ -450,7 +487,55 @@ bool DSP408::send_set_crossover_(uint8_t ch) {
       c.lpf_filter,
       c.lpf_slope,
   };
-  uint32_t cmd = 0x12000 + ch;
+  uint32_t cmd = CMD_WRITE_CROSSOVER_BASE + ch;
+  return this->send_cmd_(DIR_WRITE, cmd, CAT_PARAM, payload, sizeof(payload), 0);
+}
+
+bool DSP408::send_set_routing_(uint8_t ch) {
+  if (ch >= 8) return false;
+  ChannelState &c = this->ch_state_[ch];
+  uint32_t cmd = CMD_ROUTING_BASE + ch;
+  return this->send_cmd_(DIR_WRITE, cmd, CAT_PARAM, c.routing_lo,
+                         sizeof(c.routing_lo), 0);
+}
+
+bool DSP408::send_set_eq_band_(uint8_t ch, uint8_t band, uint16_t freq_hz,
+                               int16_t gain_raw, uint8_t b4_byte) {
+  if (ch >= 8 || band >= EQ_BAND_COUNT) return false;
+  uint8_t payload[8] = {
+      static_cast<uint8_t>(freq_hz & 0xFF),
+      static_cast<uint8_t>((freq_hz >> 8) & 0xFF),
+      static_cast<uint8_t>(gain_raw & 0xFF),
+      static_cast<uint8_t>((gain_raw >> 8) & 0xFF),
+      b4_byte,
+      0x00, 0x00, 0x00,
+  };
+  uint32_t cmd = CMD_WRITE_EQ_BAND_BASE +
+                 (static_cast<uint32_t>(band) << 8) +
+                 static_cast<uint32_t>(ch);
+  return this->send_cmd_(DIR_WRITE, cmd, CAT_PARAM, payload, sizeof(payload), 0);
+}
+
+bool DSP408::send_get_preset_name_() {
+  return this->send_cmd_(DIR_CMD, CMD_PRESET_NAME, CAT_STATE, nullptr, 0,
+                         this->next_read_seq_++);
+}
+
+bool DSP408::send_set_preset_name_(const std::string &name) {
+  // Preset name is 15-byte ASCII NUL-padded.
+  uint8_t payload[15] = {};
+  size_t n = std::min(name.size(), sizeof(payload));
+  memcpy(payload, name.data(), n);
+  return this->send_cmd_(DIR_WRITE, CMD_PRESET_NAME, CAT_STATE,
+                         payload, sizeof(payload), 0);
+}
+
+bool DSP408::send_set_channel_name_(uint8_t ch, const std::string &name) {
+  if (ch >= 8) return false;
+  uint8_t payload[8] = {};
+  size_t n = std::min(name.size(), sizeof(payload));
+  memcpy(payload, name.data(), n);
+  uint32_t cmd = CMD_WRITE_CHANNEL_NAME_BASE + ch;
   return this->send_cmd_(DIR_WRITE, cmd, CAT_PARAM, payload, sizeof(payload), 0);
 }
 
@@ -615,6 +700,14 @@ void DSP408::handle_channel_state_blob_(uint8_t ch, const uint8_t *blob, size_t 
                   (static_cast<uint16_t>(blob[OFF_LPF_FREQ + 1]) << 8);
   c.lpf_filter = blob[OFF_LPF_FILTER];
   c.lpf_slope = blob[OFF_LPF_SLOPE];
+
+  // Output routing matrix (low bank — IN1..IN8 levels at offsets 264..271)
+  memcpy(c.routing_lo, blob + OFF_MIXER, sizeof(c.routing_lo));
+
+  // Per-channel name (8 bytes ASCII at offsets 288..295, NUL-padded)
+  memcpy(c.name, blob + OFF_NAME, NAME_LEN);
+  c.name[NAME_LEN] = '\0';
+
   c.primed = true;
 
   ESP_LOGI(TAG,
@@ -637,6 +730,9 @@ void DSP408::handle_channel_state_blob_(uint8_t ch, const uint8_t *blob, size_t 
       this->last_master_poll_ms_ = now;
       ESP_LOGI(TAG, "DSP-408 ready (full state read; startup took %u ms)",
                static_cast<unsigned>(now - this->connected_at_ms_));
+      // Fire-and-forget preset-name read — the reply arrives async and
+      // the entity (if any) gets published. Failure here is non-fatal.
+      this->send_get_preset_name_();
     } else {
       // Kick off the next channel read.
       if (!this->send_read_channel_(this->warmup_channel_)) {
@@ -659,6 +755,45 @@ void DSP408::handle_crossover_write_ack_(uint32_t cmd, const uint8_t *payload, s
   (void) payload;
 }
 
+void DSP408::handle_routing_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len) {
+  uint8_t ch = static_cast<uint8_t>(cmd - CMD_ROUTING_BASE);
+  ESP_LOGD(TAG, "Routing ch%u write ack (len=%u)", ch, static_cast<unsigned>(len));
+  (void) payload;
+}
+
+void DSP408::handle_eq_band_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len) {
+  uint32_t off = cmd - CMD_WRITE_EQ_BAND_BASE;
+  uint8_t band = static_cast<uint8_t>((off >> 8) & 0xFF);
+  uint8_t ch = static_cast<uint8_t>(off & 0xFF);
+  ESP_LOGD(TAG, "EQ ch%u band%u write ack (len=%u)", ch, band, static_cast<unsigned>(len));
+  (void) payload;
+}
+
+void DSP408::handle_channel_name_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len) {
+  uint8_t ch = static_cast<uint8_t>(cmd - CMD_WRITE_CHANNEL_NAME_BASE);
+  ESP_LOGD(TAG, "Channel name ch%u write ack (len=%u)", ch, static_cast<unsigned>(len));
+  if (ch < 8 && this->ch_name_text_[ch] != nullptr) {
+    // Re-publish from cache (we cached the desired name in request_channel_name).
+    this->ch_name_text_[ch]->publish_state(std::string(this->ch_state_[ch].name));
+  }
+  (void) payload;
+}
+
+void DSP408::handle_preset_name_reply_(const uint8_t *payload, size_t len, bool is_ack) {
+  if (is_ack) {
+    ESP_LOGD(TAG, "Preset-name write ack");
+    return;
+  }
+  // Read reply: 15 bytes ASCII (firmware NUL-pads at the end).
+  size_t copy_len = std::min<size_t>(len, sizeof(this->preset_name_) - 1);
+  memcpy(this->preset_name_, payload, copy_len);
+  this->preset_name_[copy_len] = '\0';
+  this->preset_name_known_ = true;
+  ESP_LOGI(TAG, "Preset name: '%s'", this->preset_name_);
+  if (this->preset_name_text_ != nullptr)
+    this->preset_name_text_->publish_state(std::string(this->preset_name_));
+}
+
 void DSP408::publish_channel_state_(uint8_t ch) {
   if (ch >= 8) return;
   ChannelState &c = this->ch_state_[ch];
@@ -674,6 +809,22 @@ void DSP408::publish_channel_state_(uint8_t ch) {
     this->ch_hpf_freq_num_[ch]->publish_state(static_cast<float>(c.hpf_freq_hz));
   if (this->ch_lpf_freq_num_[ch] != nullptr)
     this->ch_lpf_freq_num_[ch]->publish_state(static_cast<float>(c.lpf_freq_hz));
+  // Filter type / slope select entities — index-as-string (the select
+  // sub-platform decodes index→option; we publish via the option string).
+  static const char *FILTER_NAMES[4] = {"Butterworth", "Bessel", "Linkwitz-Riley", "Linkwitz-Riley"};
+  static const char *SLOPE_NAMES_[9] = {
+      "6 dB/oct", "12 dB/oct", "18 dB/oct", "24 dB/oct",
+      "30 dB/oct", "36 dB/oct", "42 dB/oct", "48 dB/oct", "Off"};
+  if (this->ch_hpf_filter_sel_[ch] != nullptr && c.hpf_filter < 4)
+    this->ch_hpf_filter_sel_[ch]->publish_state(FILTER_NAMES[c.hpf_filter]);
+  if (this->ch_hpf_slope_sel_[ch] != nullptr && c.hpf_slope < 9)
+    this->ch_hpf_slope_sel_[ch]->publish_state(SLOPE_NAMES_[c.hpf_slope]);
+  if (this->ch_lpf_filter_sel_[ch] != nullptr && c.lpf_filter < 4)
+    this->ch_lpf_filter_sel_[ch]->publish_state(FILTER_NAMES[c.lpf_filter]);
+  if (this->ch_lpf_slope_sel_[ch] != nullptr && c.lpf_slope < 9)
+    this->ch_lpf_slope_sel_[ch]->publish_state(SLOPE_NAMES_[c.lpf_slope]);
+  if (this->ch_name_text_[ch] != nullptr)
+    this->ch_name_text_[ch]->publish_state(std::string(c.name));
 }
 
 void DSP408::handle_channel_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len) {
@@ -802,6 +953,123 @@ void DSP408::request_channel_lpf_freq(uint8_t ch, uint16_t hz) {
   if (hz > 22000) hz = 22000;
   this->ch_state_[ch].lpf_freq_hz = hz;
   this->send_set_crossover_(ch);
+}
+
+void DSP408::request_channel_hpf_filter(uint8_t ch, uint8_t filter) {
+  if (ch >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[ch].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u hpf_filter write — phase=%d primed=%d",
+             ch, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
+    return;
+  }
+  if (filter > 3) filter = 3;
+  this->ch_state_[ch].hpf_filter = filter;
+  this->send_set_crossover_(ch);
+}
+
+void DSP408::request_channel_hpf_slope(uint8_t ch, uint8_t slope) {
+  if (ch >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[ch].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u hpf_slope write — phase=%d primed=%d",
+             ch, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
+    return;
+  }
+  if (slope > 8) slope = 8;
+  this->ch_state_[ch].hpf_slope = slope;
+  this->send_set_crossover_(ch);
+}
+
+void DSP408::request_channel_lpf_filter(uint8_t ch, uint8_t filter) {
+  if (ch >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[ch].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u lpf_filter write — phase=%d primed=%d",
+             ch, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
+    return;
+  }
+  if (filter > 3) filter = 3;
+  this->ch_state_[ch].lpf_filter = filter;
+  this->send_set_crossover_(ch);
+}
+
+void DSP408::request_channel_lpf_slope(uint8_t ch, uint8_t slope) {
+  if (ch >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[ch].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u lpf_slope write — phase=%d primed=%d",
+             ch, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
+    return;
+  }
+  if (slope > 8) slope = 8;
+  this->ch_state_[ch].lpf_slope = slope;
+  this->send_set_crossover_(ch);
+}
+
+void DSP408::request_eq_band(uint8_t ch, uint8_t band, uint16_t freq_hz,
+                             float gain_db, float q) {
+  if (ch >= 8 || band >= EQ_BAND_COUNT) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[ch].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u band%u EQ write — phase=%d primed=%d",
+             ch, band, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
+    return;
+  }
+  // Bound freq + gain to envelopes.
+  if (freq_hz < 20) freq_hz = 20;
+  if (freq_hz > 20000) freq_hz = 20000;
+  int gain_raw = static_cast<int>(std::round(gain_db * 10.0f)) + EQ_GAIN_RAW_OFFSET;
+  if (gain_raw < EQ_GAIN_RAW_MIN) gain_raw = EQ_GAIN_RAW_MIN;
+  if (gain_raw > EQ_GAIN_RAW_MAX) gain_raw = EQ_GAIN_RAW_MAX;
+
+  // Q encoding: b4_byte ≈ 256 / Q, clamped to [1..255]. Higher b4_byte
+  // = lower Q (wider peak). Default 0x34 = 52 → Q ≈ 4.9.
+  if (q < 0.1f) q = 0.1f;
+  int b4 = static_cast<int>(std::round(EQ_Q_BW_CONSTANT / q));
+  if (b4 < 1) b4 = 1;
+  if (b4 > 255) b4 = 255;
+
+  ESP_LOGD(TAG, "EQ ch%u band%u: f=%u Hz gain=%.1f dB Q=%.2f -> raw=%d b4=%u",
+           ch, band, freq_hz, gain_db, q, gain_raw, b4);
+  this->send_set_eq_band_(ch, band, freq_hz, static_cast<int16_t>(gain_raw),
+                          static_cast<uint8_t>(b4));
+}
+
+void DSP408::request_routing(uint8_t channel, uint8_t input_idx, bool on) {
+  if (channel >= 8 || input_idx >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[channel].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u routing[%u]=%d — phase=%d primed=%d", channel,
+             input_idx, on, static_cast<int>(this->phase_),
+             this->ch_state_[channel].primed);
+    return;
+  }
+  this->ch_state_[channel].routing_lo[input_idx] = on ? ROUTING_ON : ROUTING_OFF;
+  this->send_set_routing_(channel);
+}
+
+void DSP408::request_preset_name(const std::string &name) {
+  if (this->phase_ != StartupPhase::RUNNING) {
+    ESP_LOGW(TAG, "Dropping preset_name write — phase=%d",
+             static_cast<int>(this->phase_));
+    return;
+  }
+  // Cache it so we can publish back on ack.
+  size_t copy_len = std::min(name.size(), sizeof(this->preset_name_) - 1);
+  memcpy(this->preset_name_, name.data(), copy_len);
+  this->preset_name_[copy_len] = '\0';
+  this->preset_name_known_ = true;
+  this->send_set_preset_name_(name);
+  if (this->preset_name_text_ != nullptr)
+    this->preset_name_text_->publish_state(std::string(this->preset_name_));
+}
+
+void DSP408::request_channel_name(uint8_t channel, const std::string &name) {
+  if (channel >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[channel].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u name write — phase=%d primed=%d", channel,
+             static_cast<int>(this->phase_), this->ch_state_[channel].primed);
+    return;
+  }
+  size_t copy_len = std::min(name.size(), NAME_LEN);
+  memset(this->ch_state_[channel].name, 0, sizeof(this->ch_state_[channel].name));
+  memcpy(this->ch_state_[channel].name, name.data(), copy_len);
+  this->send_set_channel_name_(channel, name);
 }
 
 }  // namespace dsp408

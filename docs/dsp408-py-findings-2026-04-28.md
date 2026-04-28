@@ -1,13 +1,19 @@
 # dsp408-py findings — relayed from dsp408-esphome port
 
 While porting `dsp408-py` to a C++ ESPHome external_component (see
-[`dsp408-esphome`](http://10.15.0.6:3300/malaiwah/dsp408-esphome)) we did a
+[`dsp408-esphome`](https://github.com/malaiwah/dsp408-esphome)) we did a
 careful read of `dsp408/protocol.py` and `dsp408/device.py`. A peer-review
 agent flagged a handful of issues in the Python upstream worth surfacing
 to the dsp408-py thread. None are show-stoppers — everything below is
 "this could bite us later" not "this is broken right now."
 
 Listed in rough order of "likeliest to surprise a future maintainer."
+
+> **Status (2026-04-28, post-relay):** the dsp408-py thread shipped fixes
+> for #1, #2, #3, #4, #5, #6, #7, and #9 in commit `1375b2f`. Item #8
+> (the `_exchange` lock holding across long writes) was acknowledged as
+> intentional and left as-is, matching what we already noted FYI here.
+> Each item below carries a ✅ resolution annotation.
 
 ## 1. `device.py:1186-1245` — `set_channel(...)` with `polar=None` defaults to False instead of priming the cache
 
@@ -32,6 +38,10 @@ hasn't been primed yet, call `_prime_channel_cache(channel)` before
 reading from the cache. One extra read (~20 ms) that prevents a real
 audio surprise.
 
+✅ **Resolved** in `1375b2f` — `set_channel(polar=None)` now auto-primes
+the channel cache from the device, matching the mute/volume/polar
+single-field wrapper pattern.
+
 ## 2. `device.py:1490-1500` — `load_factory_preset(preset_id)` is documented KNOWN-BROKEN but only validates `preset_id` range
 
 The docstring is upfront ("This is known-broken — the firmware silently
@@ -43,6 +53,9 @@ because no exception fires.
 `FirmwareLimitationError` if you have a domain class) with the same
 explanation that's currently in the docstring. Lets callers gate on
 the limitation programmatically.
+
+✅ **Resolved** in `1375b2f` — now raises `NotImplementedError` before
+touching the wire.
 
 ## 3. `device.py:603-610` — `_exchange()` forces `seq=0` for ALL writes, but the comment narrowly cites `cat=0x04`
 
@@ -66,6 +79,9 @@ they're allowed.
 guard (and verify experimentally that CAT_STATE writes accept non-zero
 seq), or update the comment to "verified empirically that all writes
 use seq=0 across every category we've tested."
+
+✅ **Resolved** in `1375b2f` — comment scope corrected to "all dir=a1
+writes regardless of category."
 
 ## 4. `protocol.py:648` — `OFF_EQ_MODE = OFF_BYTE_252` deprecated alias still exported
 
@@ -91,6 +107,9 @@ def __getattr__(name):
     raise AttributeError(name)
 ```
 
+✅ **Resolved** in `1375b2f` — removed from `__all__`; symbol kept on
+the module for source-compat.
+
 ## 5. `device.py:2113-2127` — `save_preset(...)` reassembles channel state with default retry budget; one bad blob corrupts EQ in flash
 
 `save_preset(name)` does:
@@ -112,6 +131,10 @@ writing. The semantic region (248..295) is reliable per the docstring,
 so you could read twice, take the latest, but only commit if the EQ
 regions agree.
 
+✅ **Resolved** in `1375b2f` — each per-channel read now retries up to 6
+attempts and raises `ProtocolError` before committing to flash if any
+channel never converges.
+
 ## 6. `device.py:732` — `connect()` returns `payload[0]` without a non-zero check
 
 ```python
@@ -131,6 +154,9 @@ returns e.g. `0x01` for "already connected" callers won't notice.
 **Suggested fix**: `if status != 0: raise ProtocolError(f"CONNECT
 status 0x{status:02X}")` (or log a warning). Cheap defensive coding.
 
+✅ **Resolved** in `1375b2f` — `connect()` now raises `ProtocolError` on
+any reply byte != 0x00.
+
 ## 7. `device.py:1707-1711` — `set_eq_band` uses `CHANNEL_VOL_OFFSET` for EQ gain encoding
 
 The constant value (600) is correct for both encodings, but if EQ gain
@@ -140,6 +166,9 @@ vs −60..0 dB for channel — which the docstring already hints at via
 
 **Suggested fix**: define `EQ_GAIN_RAW_OFFSET = 600` in `protocol.py`
 alongside `EQ_GAIN_RAW_MIN`/`MAX` and use that here.
+
+✅ **Resolved** in `1375b2f` — separate `EQ_GAIN_OFFSET` constant added
+and used in `set_eq_band` + `set_input_eq_band`.
 
 ## 8. (FYI, no change needed) `device.py:603` — `_exchange` holds `_lock` across long writes
 
@@ -154,6 +183,9 @@ docstring at line 522 calls it out. Just flagging for future
 refactoring — if anyone tries to "fix" this by narrowing the lock
 they'll create a use-after-free.
 
+✅ **Acknowledged**: dsp408-py thread confirmed this is intentional and
+left as-is (per the original FYI status of this finding).
+
 ## 9. Stale references to "captures-needed-from-windows.md on the reverse-engineering branch"
 
 `device.py:21-46` and a few other places reference doc paths that may
@@ -162,6 +194,9 @@ work; if not, consider committing a stub of those captures-needed
 notes to main so the references resolve.
 
 (Lower priority — purely doc hygiene.)
+
+✅ **Resolved** in `1375b2f` — references normalized to
+`notes/captures-needed-from-windows.md` (matches actual file location).
 
 ---
 
@@ -201,9 +236,13 @@ chance of returning visibly bogus data (e.g. our Ch6 with
 `+324 dB / muted / subidx=0x55`). Worth documenting more
 prominently in `dsp408/mqtt.py`'s polling path.
 
+✅ **Resolved** in `1375b2f` — prominent ⚠ block added at the top of
+`dsp408/mqtt.py` explaining the EQ-region shift; the back-port note is
+credited.
+
 ---
 
 This note was generated 2026-04-28 alongside the
-[dsp408-esphome v0.2 release](http://10.15.0.6:3300/malaiwah/dsp408-esphome).
+[dsp408-esphome v0.2 release](https://github.com/malaiwah/dsp408-esphome).
 File a separate issue (or just paste relevant sections into the
 dsp408-py thread) for whichever items you want to act on.

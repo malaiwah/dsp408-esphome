@@ -18,7 +18,12 @@ import esphome.config_validation as cv
 
 CODEOWNERS = ["@malaiwah"]
 DEPENDENCIES = ["esp32", "usb_host"]
-AUTO_LOAD = ["usb_host"]
+# AUTO_LOAD pulls in the platforms our C++ unconditionally references.
+# Sub-platform Python files (number/, switch/, text_sensor/, select/, text/)
+# are ALSO auto-loaded by ESPHome when their entities appear in the user's
+# YAML, but listing them here ensures the C++ includes always resolve even
+# in a minimal config that only declares the parent.
+AUTO_LOAD = ["usb_host", "text", "select"]
 MULTI_CONF = True
 
 # Used by sub-platform configs to attach entities to a specific DSP-408

@@ -269,6 +269,125 @@ static void test_build_frame_payload_too_large() {
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// EQ band write — cmd = 0x10000 + (band << 8) + channel
+// payload = [freq_le16, gain_raw_le16, b4_byte, 0, 0, 0]
+// for ch=2, band=4, freq=500 Hz, gain=-3 dB (raw = -30 + 600 = 570),
+//          Q=4.0 (b4 = round(256/4) = 64):
+//   payload = [F4 01 3A 02 40 00 00 00]
+//   cmd     = 0x10000 + (4 << 8) + 2 = 0x10402
+// ────────────────────────────────────────────────────────────────────────
+
+static void test_build_frame_eq_band_write() {
+  uint8_t payload[8] = {0xF4, 0x01, 0x3A, 0x02, 0x40, 0x00, 0x00, 0x00};
+  uint8_t out[FRAME_SIZE];
+  uint32_t cmd = CMD_WRITE_EQ_BAND_BASE + (4u << 8) + 2u;  // 0x10402
+  bool ok = build_frame(out, DIR_WRITE, 0, cmd, CAT_PARAM, payload, sizeof(payload));
+  assert(ok);
+
+  // cmd=0x10402 LE = 02 04 01 00
+  uint8_t want_hdr[HEADER_SIZE] = {
+      0x80, 0x80, 0x80, 0xEE,
+      0xA1, 0x01, 0x00, 0x04,
+      0x02, 0x04, 0x01, 0x00,
+      0x08, 0x00,
+  };
+  assert(eq_bytes(out, want_hdr, HEADER_SIZE, "eq_band_header"));
+  assert(eq_bytes(out + HEADER_SIZE, payload, 8, "eq_band_payload"));
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Routing write — cmd = 0x2100 + ch, 8-byte payload (IN1..IN8 levels).
+// for ch=0 with IN1 ON, others OFF:
+//   payload = [64 00 00 00 00 00 00 00]
+//   cmd     = 0x2100
+// ────────────────────────────────────────────────────────────────────────
+
+static void test_build_frame_routing_write() {
+  uint8_t payload[8] = {ROUTING_ON, 0, 0, 0, 0, 0, 0, 0};
+  uint8_t out[FRAME_SIZE];
+  bool ok = build_frame(out, DIR_WRITE, 0, CMD_ROUTING_BASE + 0, CAT_PARAM,
+                        payload, sizeof(payload));
+  assert(ok);
+
+  // cmd=0x2100 LE = 00 21 00 00
+  uint8_t want_hdr[HEADER_SIZE] = {
+      0x80, 0x80, 0x80, 0xEE,
+      0xA1, 0x01, 0x00, 0x04,
+      0x00, 0x21, 0x00, 0x00,
+      0x08, 0x00,
+  };
+  assert(eq_bytes(out, want_hdr, HEADER_SIZE, "routing_header"));
+  assert(eq_bytes(out + HEADER_SIZE, payload, 8, "routing_payload"));
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Per-channel name write — cmd = 0x2400 + ch, 8-byte ASCII NUL-pad.
+// for ch=0, name="Tweet":
+//   payload = ['T' 'w' 'e' 'e' 't' 00 00 00]
+//   cmd     = 0x2400
+// ────────────────────────────────────────────────────────────────────────
+
+static void test_build_frame_channel_name_write() {
+  uint8_t payload[8] = {'T', 'w', 'e', 'e', 't', 0, 0, 0};
+  uint8_t out[FRAME_SIZE];
+  bool ok = build_frame(out, DIR_WRITE, 0, CMD_WRITE_CHANNEL_NAME_BASE + 0,
+                        CAT_PARAM, payload, sizeof(payload));
+  assert(ok);
+
+  // cmd=0x2400 LE = 00 24 00 00
+  uint8_t want_hdr[HEADER_SIZE] = {
+      0x80, 0x80, 0x80, 0xEE,
+      0xA1, 0x01, 0x00, 0x04,
+      0x00, 0x24, 0x00, 0x00,
+      0x08, 0x00,
+  };
+  assert(eq_bytes(out, want_hdr, HEADER_SIZE, "channel_name_header"));
+  assert(eq_bytes(out + HEADER_SIZE, payload, 8, "channel_name_payload"));
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Preset-name write — cmd = 0x00, cat=0x09, 15-byte ASCII NUL-pad.
+// ────────────────────────────────────────────────────────────────────────
+
+static void test_build_frame_preset_name_write() {
+  uint8_t payload[15] = {'B','e','n','c','h',0,0,0,0,0,0,0,0,0,0};
+  uint8_t out[FRAME_SIZE];
+  bool ok = build_frame(out, DIR_WRITE, 0, CMD_PRESET_NAME, CAT_STATE,
+                        payload, sizeof(payload));
+  assert(ok);
+  uint8_t want_hdr[HEADER_SIZE] = {
+      0x80, 0x80, 0x80, 0xEE,
+      0xA1, 0x01, 0x00, 0x09,
+      0x00, 0x00, 0x00, 0x00,
+      0x0F, 0x00,
+  };
+  assert(eq_bytes(out, want_hdr, HEADER_SIZE, "preset_name_header"));
+  assert(eq_bytes(out + HEADER_SIZE, payload, 15, "preset_name_payload"));
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// EQ Q ↔ b4_byte encoding: b4 ≈ 256 / Q, clamped to [1..255].
+// ────────────────────────────────────────────────────────────────────────
+
+static void test_eq_q_encoding() {
+  // Spot-check the encoding constants.
+  assert(EQ_Q_BW_CONSTANT == 256.0f);
+  assert(EQ_GAIN_RAW_OFFSET == 600);
+  assert(EQ_GAIN_RAW_MIN == 0);
+  assert(EQ_GAIN_RAW_MAX == 1200);
+
+  // Default firmware Q=4.9 → b4 ≈ 256/4.9 ≈ 52 (matches dsp408-py docstring)
+  int b4 = static_cast<int>(EQ_Q_BW_CONSTANT / 4.9f + 0.5f);
+  assert(b4 == 52);
+  // Q=2 → b4=128
+  b4 = static_cast<int>(EQ_Q_BW_CONSTANT / 2.0f + 0.5f);
+  assert(b4 == 128);
+  // Q=8 → b4=32
+  b4 = static_cast<int>(EQ_Q_BW_CONSTANT / 8.0f + 0.5f);
+  assert(b4 == 32);
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Constant sanity
 // ────────────────────────────────────────────────────────────────────────
 
@@ -307,6 +426,11 @@ int main() {
   RUN(test_build_frame_master_write);
   RUN(test_build_frame_channel_write);
   RUN(test_build_frame_crossover_write);
+  RUN(test_build_frame_eq_band_write);
+  RUN(test_build_frame_routing_write);
+  RUN(test_build_frame_channel_name_write);
+  RUN(test_build_frame_preset_name_write);
+  RUN(test_eq_q_encoding);
   RUN(test_round_trip_master_read);
   RUN(test_round_trip_master_write);
   RUN(test_parse_multi_frame_first);

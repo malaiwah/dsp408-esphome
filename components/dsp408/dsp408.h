@@ -36,8 +36,10 @@ namespace esphome {
 // Forward decls so the .h can mention pointers without dragging in
 // the full sub-platform headers.
 namespace text_sensor { class TextSensor; }
+namespace text { class Text; }
 namespace number { class Number; }
 namespace switch_ { class Switch; }
+namespace select { class Select; }
 
 namespace dsp408 {
 
@@ -98,6 +100,22 @@ class DSP408 : public usb_host::USBClient {
   void set_channel_lpf_freq_number(uint8_t ch, number::Number *n) {
     if (ch < 8) this->ch_lpf_freq_num_[ch] = n;
   }
+  void set_channel_hpf_filter_select(uint8_t ch, select::Select *s) {
+    if (ch < 8) this->ch_hpf_filter_sel_[ch] = s;
+  }
+  void set_channel_hpf_slope_select(uint8_t ch, select::Select *s) {
+    if (ch < 8) this->ch_hpf_slope_sel_[ch] = s;
+  }
+  void set_channel_lpf_filter_select(uint8_t ch, select::Select *s) {
+    if (ch < 8) this->ch_lpf_filter_sel_[ch] = s;
+  }
+  void set_channel_lpf_slope_select(uint8_t ch, select::Select *s) {
+    if (ch < 8) this->ch_lpf_slope_sel_[ch] = s;
+  }
+  void set_preset_name_text(text::Text *t) { this->preset_name_text_ = t; }
+  void set_channel_name_text(uint8_t ch, text::Text *t) {
+    if (ch < 8) this->ch_name_text_[ch] = t;
+  }
 
   // Public command entry points (called from main loop / entity control()).
   // These post an OUT transfer; replies arrive asynchronously and update
@@ -110,6 +128,28 @@ class DSP408 : public usb_host::USBClient {
   void request_channel_polar(uint8_t ch, bool inverted);
   void request_channel_hpf_freq(uint8_t ch, uint16_t hz);
   void request_channel_lpf_freq(uint8_t ch, uint16_t hz);
+  void request_channel_hpf_filter(uint8_t ch, uint8_t filter);
+  void request_channel_hpf_slope(uint8_t ch, uint8_t slope);
+  void request_channel_lpf_filter(uint8_t ch, uint8_t filter);
+  void request_channel_lpf_slope(uint8_t ch, uint8_t slope);
+
+  // EQ band write — cmd = 0x10000 + (band << 8) + channel.
+  // Q is converted to b4_byte via 256/Q with clamping to [1..255].
+  void request_eq_band(uint8_t channel, uint8_t band, uint16_t freq_hz,
+                       float gain_db, float q);
+
+  // Routing matrix cell — sets the mixer level for one (channel, input)
+  // pair. `level` is mapped: 0 = OFF, anything else = ON (0x64). Channel
+  // is the OUTPUT (0..7), input_idx is 0..7 (low bank IN1..IN8).
+  // For IN9..IN16 use the high bank API (DSP-408 hw only has 4 inputs;
+  // most users won't need this).
+  void request_routing(uint8_t channel, uint8_t input_idx, bool on);
+
+  // Preset-name read/write (15-byte ASCII in cat=CAT_STATE).
+  void request_preset_name(const std::string &name);
+
+  // Channel name write (cmd=0x2400+ch, CAT_PARAM, 8-byte ASCII NUL-pad).
+  void request_channel_name(uint8_t channel, const std::string &name);
 
  protected:
   // ───────── USB descriptor walk + interface claim ─────────────────────
@@ -139,6 +179,12 @@ class DSP408 : public usb_host::USBClient {
   bool send_set_channel_(uint8_t ch);  // builds payload from ch_state_
   bool send_read_channel_(uint8_t ch);  // multi-frame 296-byte read
   bool send_set_crossover_(uint8_t ch);
+  bool send_set_routing_(uint8_t ch);   // builds payload from ch_state_
+  bool send_set_eq_band_(uint8_t ch, uint8_t band, uint16_t freq_hz,
+                         int16_t gain_raw, uint8_t b4_byte);
+  bool send_set_preset_name_(const std::string &name);
+  bool send_get_preset_name_();
+  bool send_set_channel_name_(uint8_t ch, const std::string &name);
 
   // ───────── Frame handlers ────────────────────────────────────────────
   void handle_connect_reply_(const uint8_t *payload, size_t len);
@@ -147,6 +193,10 @@ class DSP408 : public usb_host::USBClient {
   void handle_channel_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len);
   void handle_channel_state_blob_(uint8_t ch, const uint8_t *blob, size_t len);
   void handle_crossover_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len);
+  void handle_preset_name_reply_(const uint8_t *payload, size_t len, bool is_ack);
+  void handle_routing_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len);
+  void handle_eq_band_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len);
+  void handle_channel_name_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len);
 
   // Publish the full set of cached state for one channel to all
   // attached entities (volume, mute, delay, polar, hpf/lpf).
@@ -168,13 +218,24 @@ class DSP408 : public usb_host::USBClient {
 
     // Crossover (HPF + LPF)
     uint16_t hpf_freq_hz = 20;     // default lower bound
-    uint8_t hpf_filter = 0;        // 0=BW 1=Bessel 2=LR
+    uint8_t hpf_filter = 0;        // 0=BW 1=Bessel 2=LR (3=LR alias)
     uint8_t hpf_slope = 8;         // 8 = Off (default)
     uint16_t lpf_freq_hz = 20000;
     uint8_t lpf_filter = 0;
     uint8_t lpf_slope = 8;
+
+    // Output routing matrix — IN1..IN8 levels (low bank). DSP-408 hw
+    // exposes 4 physical inputs; cells 4..7 read 0 in practice.
+    uint8_t routing_lo[8] = {};
+
+    // 8-byte ASCII channel name (NUL-padded), from blob[288..295].
+    char name[9] = {};  // 8 chars + NUL terminator for safe printing
   };
   ChannelState ch_state_[8];
+
+  // Preset name (15-byte ASCII, NUL-terminated for safe printing).
+  char preset_name_[16] = {};
+  bool preset_name_known_ = false;
 
   // ───────── USB endpoint state ────────────────────────────────────────
   uint8_t intf_number_ = 0xFF;
@@ -214,6 +275,12 @@ class DSP408 : public usb_host::USBClient {
   switch_::Switch *ch_polar_sw_[8] = {};
   number::Number *ch_hpf_freq_num_[8] = {};
   number::Number *ch_lpf_freq_num_[8] = {};
+  select::Select *ch_hpf_filter_sel_[8] = {};
+  select::Select *ch_hpf_slope_sel_[8] = {};
+  select::Select *ch_lpf_filter_sel_[8] = {};
+  select::Select *ch_lpf_slope_sel_[8] = {};
+  text::Text *preset_name_text_ = nullptr;
+  text::Text *ch_name_text_[8] = {};
 
   // ───────── Cached master state (from last reply) ─────────────────────
   bool master_known_ = false;
@@ -224,6 +291,16 @@ class DSP408 : public usb_host::USBClient {
   // future firmware has them).
   uint32_t last_master_poll_ms_ = 0;
   static constexpr uint32_t MASTER_POLL_INTERVAL_MS = 5000;
+
+  // Round-robin which channel's cached state we re-publish each tick.
+  // Burst-publishing all 8 × 6 entity states at once during the master
+  // poll overruns the ESPHome native API send buffer when the entity
+  // surface gets large (~60+ entities), causing HA's connection to drop.
+  // Spreading it across MASTER_POLL_INTERVAL_MS / 8 = ~625 ms per
+  // channel keeps each tick's message volume manageable.
+  uint8_t republish_channel_rr_ = 0;
+  uint32_t last_republish_ms_ = 0;
+  static constexpr uint32_t REPUBLISH_STAGGER_MS = 625;
 
   // ───────── Multi-frame reassembly state ──────────────────────────────
   // The DSP-408 returns 296-byte payloads (cmd=0x77NN channel-state read)

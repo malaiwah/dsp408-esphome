@@ -3,22 +3,23 @@
 ESPHome external_component that talks to a Dayton Audio **DSP-408** directly
 from an **ESP32-S3**'s native USB host peripheral. Plug the DSP-408 into the
 ESP32-S3's USB-OTG port and the device shows up in Home Assistant as a
-proper integration with sliders, switches and read-back state — no MQTT
+proper integration with sliders, switches, selects and text fields — no MQTT
 glue, no USBIP, no Linux client, no kernel HID layer in the path.
 
 <p align="center">
-  <img src="docs/screenshots/device-page.png" alt="DSP-408 Test device page in Home Assistant — 27 entities live"
+  <img src="docs/screenshots/device-page.png" alt="DSP-408 Test device page in Home Assistant — full v0.3 surface with HPF type/slope selects, channel name text, sliders for volume / delay / freq, polar / mute switches"
        width="700">
 </p>
 
 > *Above: the auto-generated device page Home Assistant builds from the
-> ESPHome native API surface. Per-channel volume, mute, polar, delay,
-> HPF/LPF for channels 1–4, master volume + mute, and the firmware
-> identity sensor — all live, all bidirectional.*
+> ESPHome native API surface. Per-channel volume / mute / polar / delay
+> / HPF freq+type+slope / LPF freq+type+slope / name across all 8
+> outputs, master volume + mute, preset name, and the firmware identity
+> sensor — all live, all bidirectional.*
 
 ## Status
 
-**v0.2 — beta** (2026-04-28). Validated on an ESP32-S3 DevKitC-1 + a real
+**v0.3 — beta** (2026-04-28). Validated on an ESP32-S3 DevKitC-1 + a real
 DSP-408 (firmware `MYDW-AV1.06`), driven from a live Home Assistant
 instance over WiFi.
 
@@ -27,12 +28,25 @@ instance over WiFi.
 | Model identity             | `text_sensor` | `MYDW-AV1.06` on stock fw                            |
 | Master volume              | `number`      | -60..+6 dB, 1 dB step                                |
 | Master mute                | `switch`      | off=audible, on=muted                                |
+| Preset name                | `text`        | 15-byte ASCII, persisted in device flash             |
 | Channel volume × 8         | `number`      | -60..0 dB, 1 dB step                                 |
 | Channel mute × 8           | `switch`      | per-output mute                                      |
 | Channel polar × 8          | `switch`      | 180° phase invert                                    |
 | Channel delay × 8          | `number`      | 0..359 samples (≈ 8.143 ms @ 44.1 kHz)               |
 | Channel HPF cutoff × 8     | `number`      | 10..20000 Hz                                         |
 | Channel LPF cutoff × 8     | `number`      | 100..22000 Hz                                        |
+| Channel HPF type × 8       | `select`      | Butterworth / Bessel / Linkwitz-Riley                |
+| Channel HPF slope × 8      | `select`      | 6..48 dB/oct, plus "Off"                             |
+| Channel LPF type × 8       | `select`      | Butterworth / Bessel / Linkwitz-Riley                |
+| Channel LPF slope × 8      | `select`      | 6..48 dB/oct, plus "Off"                             |
+| Channel name × 8           | `text`        | 8-byte ASCII                                         |
+| EQ band write              | service       | `set_eq_band(channel, band, freq_hz, gain_db, q)`    |
+| Routing matrix write       | service       | `set_routing(channel, input_idx, enabled)`           |
+
+EQ (10 bands × 8 channels = 80 cells × 3 fields each) and the routing
+matrix (4 inputs × 8 outputs = 32 cells) are exposed as user-defined
+**service actions** rather than entities — too numerous for a useful
+HA dashboard, more natural as scripted calls.
 
 On connect, the bridge reads each channel's full 296-byte state blob
 (via the multi-frame `cmd=0x77NN` path, with read-divergence retry up
@@ -40,17 +54,65 @@ to 4 attempts) and populates entities from device truth. Writes are
 gated on warmup completion + cache-primed status to prevent the
 "fresh-boot HA touch surges channel to 0 dB" hazard.
 
-### Roadmap to v0.3
+### Roadmap to v0.4
 
-Tracked in [`docs/peer-review-2026-04-28.md`](docs/peer-review-2026-04-28.md):
-
-- HPF/LPF filter type + slope as `select` entities
-- 10-band parametric EQ (per-channel × per-band)
-- Output routing matrix (4 inputs × 8 outputs)
-- Preset name + per-channel name read/write
-- Multi-frame WRITE for `set_full_channel_state` / preset save
 - Compressor / dynamics (firmware-inert in v1.06 — low priority)
 - Input-side processing (cat=0x03 plane)
+- Multi-frame WRITE for `set_full_channel_state` / preset save+load
+- 0.1 dB resolution on per-channel volume
+- Bounded request queue for fast slider drag operations
+
+## What it looks like booting
+
+```
+[I][logger:120]: Log initialized
+[I][app:067]: Running through setup()
+[C][dsp408:041]: DSP-408 USB host client initialised (VID 0x0483 PID 0x5750)
+[C][component:246]: Setup wifi took 57ms
+[C][esphome.ota:071]:   Address: dsp408-test.local:3232
+[C][api:235]: Server:
+[C][api:235]:   Address: dsp408-test.local:6053
+[I][dsp408:077]: Claimed HID interface 0, EP-IN=0x82 EP-OUT=0x01
+[I][dsp408:579]: CONNECT ok (status=0x00)
+[I][dsp408:594]: GET_INFO: 'MYDW-AV1.06'
+[I][dsp408:621]: MASTER read: -5 dB (audible)
+[D][dsp408:639]: Warmup: reading channel 0 (attempt 1)
+[D][dsp408:665]: Ch0: read divergence — retry attempt 2
+[D][dsp408:676]: Ch0: converged after 2 attempts
+[I][dsp408:713]: Ch0: +0 dB (audible) delay=0  HPF=20Hz/0/1  LPF=20000Hz/0/1  subidx=0x01
+[D][dsp408:665]: Ch1: read divergence — retry attempt 2
+[D][dsp408:665]: Ch1: read divergence — retry attempt 3
+[D][dsp408:676]: Ch1: converged after 3 attempts
+[I][dsp408:713]: Ch1: -1 dB (audible) delay=0  HPF=2500Hz/0/1  LPF=20000Hz/0/1  subidx=0x04
+[I][dsp408:713]: Ch2: -34 dB (muted) (POLAR) delay=20  HPF=20Hz/0/1  LPF=20000Hz/0/1  subidx=0x00
+[I][dsp408:713]: Ch3: +0 dB (audible) delay=0  HPF=20Hz/0/1  LPF=20000Hz/0/1  subidx=0x07
+[I][dsp408:713]: Ch4: +0 dB (audible) delay=0  HPF=20Hz/0/1  LPF=20000Hz/0/1  subidx=0x08
+[I][dsp408:713]: Ch5: +0 dB (audible) delay=0  HPF=20Hz/0/1  LPF=20000Hz/0/1  subidx=0x09
+[I][dsp408:713]: Ch6: +324 dB (muted) delay=0  HPF=20Hz/0/1  LPF=20000Hz/0/1  subidx=0x55
+[I][dsp408:713]: Ch7: +0 dB (audible) delay=0  HPF=20Hz/0/1  LPF=20000Hz/0/1  subidx=0x12
+[I][dsp408:731]: DSP-408 ready (full state read; startup took 1741 ms)
+```
+
+A few notable lines:
+
+- **`MYDW-AV1.06`** is the firmware identity string returned by the
+  DSP-408 GET_INFO response — exposed as a `text_sensor` in HA.
+- **`Master read: -5 dB`** reflects the persisted state from the
+  previous test session — the DSP-408 keeps master volume in flash.
+- **`Ch1: read divergence — retry attempt 2/3`** is the multi-frame
+  read retry kicking in. The firmware occasionally emits a 2-byte-
+  shifted variant of the channel state blob; we re-read up to 4
+  times until two consecutive reads agree (a port of dsp408-py's
+  `retry_on_divergence`). Every channel typically converges within
+  2-3 attempts.
+- **`Ch6: +324 dB (muted) subidx=0x55`** is a known firmware quirk
+  on this particular spare unit — Ch6 is the only channel that
+  occasionally still misreports gain even with retries. Captured in
+  the bring-up notes; harmless because writes go through fine and
+  state can be corrected via HA.
+- **`startup took 1741 ms`** — boot to first-control on a fresh
+  reset. ~310 ms USB enumeration + ~100 ms identity probe + ~1.3 s
+  for the 8-channel state read pass with retries.
 
 ## Hardware
 
@@ -67,6 +129,8 @@ Tracked in [`docs/peer-review-2026-04-28.md`](docs/peer-review-2026-04-28.md):
   (the on-board CP2102/CH340 bridge on the DevKitC-1's other USB-C jack).
 
 ## Usage
+
+Minimal config:
 
 ```yaml
 external_components:
@@ -88,56 +152,73 @@ dsp408:
   id: my_dsp
 
 text_sensor:
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: MODEL
-    name: "DSP-408 Model"
+  - { platform: dsp408, dsp408_id: my_dsp, kind: MODEL, name: "DSP-408 Model" }
 
 number:
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: MASTER_VOLUME
-    name: "Master Volume"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_VOLUME
-    channel: 0
-    name: "Ch1 Volume"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_DELAY
-    channel: 0
-    name: "Ch1 Delay"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_HPF_FREQ
-    channel: 0
-    name: "Ch1 HPF"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_LPF_FREQ
-    channel: 0
-    name: "Ch1 LPF"
+  - { platform: dsp408, dsp408_id: my_dsp, kind: MASTER_VOLUME, name: "Master Volume" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_VOLUME, channel: 0, name: "Ch1 Volume" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_DELAY,  channel: 0, name: "Ch1 Delay" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FREQ, channel: 0, name: "Ch1 HPF" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FREQ, channel: 0, name: "Ch1 LPF" }
 
 switch:
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: MASTER_MUTE
-    name: "Master Mute"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_MUTE
-    channel: 0
-    name: "Ch1 Mute"
-  - platform: dsp408
-    dsp408_id: my_dsp
-    kind: CHANNEL_POLAR
-    channel: 0
-    name: "Ch1 Polar"
+  - { platform: dsp408, dsp408_id: my_dsp, kind: MASTER_MUTE,  name: "Master Mute" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_MUTE, channel: 0, name: "Ch1 Mute" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_POLAR, channel: 0, name: "Ch1 Polar" }
+
+select:
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FILTER, channel: 0, name: "Ch1 HPF Type" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_SLOPE,  channel: 0, name: "Ch1 HPF Slope" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FILTER, channel: 0, name: "Ch1 LPF Type" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_SLOPE,  channel: 0, name: "Ch1 LPF Slope" }
+
+text:
+  - { platform: dsp408, dsp408_id: my_dsp, kind: PRESET_NAME, name: "Preset Name", mode: text }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_NAME, channel: 0, name: "Ch1 Name", mode: text }
 ```
 
-See [`examples/dsp408-test.yaml`](examples/dsp408-test.yaml) for a fully-
-populated config (4 channels with all six per-channel controls) and
+### Service actions (EQ + routing)
+
+```yaml
+api:
+  encryption:
+    key: !secret api_encryption_key
+  actions:
+    - action: set_eq_band
+      variables: { channel: int, band: int, freq_hz: int, gain_db: float, q: float }
+      then:
+        - lambda: |-
+            id(my_dsp).request_eq_band(
+                static_cast<uint8_t>(channel),
+                static_cast<uint8_t>(band),
+                static_cast<uint16_t>(freq_hz),
+                gain_db, q);
+    - action: set_routing
+      variables: { channel: int, input_idx: int, enabled: bool }
+      then:
+        - lambda: |-
+            id(my_dsp).request_routing(
+                static_cast<uint8_t>(channel),
+                static_cast<uint8_t>(input_idx),
+                enabled);
+```
+
+From HA: **Developer Tools → Services →** `esphome.dsp408_test_set_eq_band`
+or `set_routing`. Or call from automations:
+
+```yaml
+service: esphome.dsp408_test_set_eq_band
+data:
+  channel: 0
+  band: 5
+  freq_hz: 1000
+  gain_db: -3.0
+  q: 4.0
+```
+
+See [`examples/dsp408-test.yaml`](examples/dsp408-test.yaml) for the full
+v0.3 reference config (8 channels, all entity types, EQ + routing
+service actions, WiFi/API/OTA), and
 [`examples/dsp408-test-minimal.yaml`](examples/dsp408-test-minimal.yaml)
 for a no-network bench-test variant.
 
@@ -148,10 +229,20 @@ up under **Settings → Devices & Services → Discovered**. Click "Configure",
 paste the API encryption key from your `secrets.yaml`, and HA will
 register all entities automatically.
 
-<p align="center">
-  <img src="docs/screenshots/integrations-list.png" alt="DSP-408 Test in the Home Assistant ESPHome integration list — 27 entities"
-       width="640">
-</p>
+### Practical entity-count ceiling
+
+The ESPHome native API has a soft ceiling around ~60 entities per device
+on this HA build (2026.3.1 + ESPHome 2026.4.1). Past that you may see
+HA-side `CONNECTION_CLOSED` loops because the entity-list message
+overflows somewhere. Each `select` entity is "fatter" than a `number` or
+`switch` because it carries its options strings.
+
+The reference example demonstrates all entity TYPES while staying under
+the ceiling — selects on Ch1 only, channel-name text on Ch1 only, the
+"everyday" 6 controls (volume/mute/polar/delay/HPF/LPF) on all 8
+channels. Extending selects + names to all 8 outputs is mechanical; if
+you do, expect to either trim something else or wait for an upstream
+ESPHome fix.
 
 ## Architecture
 
@@ -163,7 +254,7 @@ register all entities automatically.
 ┌─────┴────────┐
 │ ESPHome      │   esp32-s3
 │  ┌─────────┐ │
-│  │ entities│◄┼── number / switch / text_sensor
+│  │ entities│◄┼── number / switch / text_sensor / text / select
 │  └────┬────┘ │
 │       │      │   in-process function calls (main loop task)
 │  ┌────▼────┐ │
@@ -192,12 +283,11 @@ entity `control()` handlers on the main loop.
 ## Provenance
 
 The wire-format port is line-for-line traceable to
-[**dsp408-py**](https://github.com/malaiwah/dsp408-py) (also at
-[gitea](http://10.15.0.6:3300/malaiwah/dsp408-py)) — same 64-byte HID
-frame layout, same XOR checksum, same command codes, same blob offsets,
-same field semantics. dsp408-py did the heavy lifting of reverse-
-engineering the device against the Windows GUI captures; this project
-just turns that knowledge into ESP32 firmware.
+[**dsp408-py**](https://github.com/malaiwah/dsp408-py) — same 64-byte
+HID frame layout, same XOR checksum, same command codes, same blob
+offsets, same field semantics. dsp408-py did the heavy lifting of
+reverse-engineering the device against the Windows GUI captures; this
+project just turns that knowledge into ESP32 firmware.
 
 If you're starting from scratch and want to understand **why** any
 particular byte means what it means, read dsp408-py first. Especially:
@@ -210,7 +300,7 @@ particular byte means what it means, read dsp408-py first. Especially:
   Y" calibration notes from live testing on hardware.
 
 The `docs/peer-review-2026-04-28.md` file in this repo has a full
-feature-parity matrix vs dsp408-py, plus what's deferred to v0.3.
+feature-parity matrix vs dsp408-py.
 
 ## Building + flashing
 
@@ -232,11 +322,11 @@ are picked up by the next `esphome run`.
 ## Testing
 
 Host-side unit tests cover the protocol layer (frame build/parse,
-checksum, multi-frame parsing, payload encoders):
+checksum, multi-frame parsing, payload encoders for master / channel
+/ crossover / EQ band / routing / channel name / preset name):
 
 ```bash
-cd tests
-make run
+cd tests && make run
 ```
 
 Output:
@@ -248,6 +338,11 @@ RUN test_build_frame_get_info ... OK
 RUN test_build_frame_master_write ... OK
 RUN test_build_frame_channel_write ... OK
 RUN test_build_frame_crossover_write ... OK
+RUN test_build_frame_eq_band_write ... OK
+RUN test_build_frame_routing_write ... OK
+RUN test_build_frame_channel_name_write ... OK
+RUN test_build_frame_preset_name_write ... OK
+RUN test_eq_q_encoding ... OK
 RUN test_round_trip_master_read ... OK
 RUN test_round_trip_master_write ... OK
 RUN test_parse_multi_frame_first ... OK
@@ -270,14 +365,10 @@ documented in [`docs/bring-up-2026-04-28.md`](docs/bring-up-2026-04-28.md).
   Python protocol library and `dsp408-mqtt` bridge. Pioneered the
   reverse engineering. Read this first if you want to understand the
   protocol.
-- [**dsp408-esp32-bridge**](http://10.15.0.6:3300/malaiwah/dsp408-esp32-bridge)
-  — the (now-superseded) USBIP-over-WiFi appliance, kept for context
-  on why the direct-HID-over-USBHost path is preferable. Master writes
-  used to take ~80–150 ms via that path; via this one they're 36 ms
-  end-to-end (HA → entity → USB transfer → ack), with no kernel HID
-  timeout window to lose to.
-- [**malaiwah-usbipdcpp_esp32**](http://10.15.0.6:3300/malaiwah/malaiwah-usbipdcpp_esp32)
-  — the underlying USBIP firmware fork, kept as a fallback for
-  non-DSP-408 USB devices on the home network (e.g. the DYMO label
-  printer that works fine over USBIP because it's bulk, not
-  interrupt-HID).
+
+The earlier USBIP-over-WiFi appliance approach (host-side `usbipd` →
+Linux `vhci-hcd` → kernel HID layer → hidapi → application) ran into
+intractable disconnect cascades under burst HID polling load. Master
+writes used to take ~80–150 ms via that chain; with this direct-HID-
+over-USB-Host firmware they're 36 ms end-to-end (HA → entity → USB
+transfer → ack), with no kernel timeout window to lose to.

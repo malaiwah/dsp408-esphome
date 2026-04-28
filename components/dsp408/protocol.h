@@ -61,13 +61,47 @@ static constexpr uint8_t CAT_PARAM = 0x04;
 static constexpr uint32_t CMD_CONNECT = 0xCC;
 static constexpr uint32_t CMD_IDLE_POLL = 0x03;
 static constexpr uint32_t CMD_GET_INFO = 0x04;
-static constexpr uint32_t CMD_PRESET_NAME = 0x00;
+static constexpr uint32_t CMD_PRESET_NAME = 0x00;       // 15-byte ASCII
 static constexpr uint32_t CMD_STATUS = 0x34;
 static constexpr uint32_t CMD_GLOBAL_0X02 = 0x02;
-static constexpr uint32_t CMD_MASTER = 0x05;       // alias for CMD_GLOBAL_0x05
+static constexpr uint32_t CMD_MASTER = 0x05;            // alias for CMD_GLOBAL_0x05
 static constexpr uint32_t CMD_GLOBAL_0X06 = 0x06;
-static constexpr uint32_t CMD_WRITE_CHANNEL_BASE = 0x1F00;  // + ch
-static constexpr uint32_t CMD_READ_CHANNEL_BASE = 0x7700;   // + ch (multi-frame)
+static constexpr uint32_t CMD_WRITE_CHANNEL_BASE = 0x1F00;     // + ch (CAT_PARAM)
+static constexpr uint32_t CMD_READ_CHANNEL_BASE = 0x7700;      // + ch (multi-frame)
+
+// Per-channel routing matrix writes — 0x2100..0x2107 = Ch1..Ch8.
+// 8-byte payload = u8 levels for IN1..IN8 (0x64 = ON / unity, 0x00 = OFF).
+static constexpr uint32_t CMD_ROUTING_BASE = 0x2100;
+// Mirror for IN9..IN16 — DSP-408 only has 4 physical inputs but the
+// protocol surface includes the upper half from the sibling DSP-816 firmware.
+static constexpr uint32_t CMD_ROUTING_HI_BASE = 0x2200;
+static constexpr uint8_t  ROUTING_ON  = 0x64;
+static constexpr uint8_t  ROUTING_OFF = 0x00;
+
+// Per-channel compressor write (firmware-inert in v1.06 but kept for parity).
+static constexpr uint32_t CMD_WRITE_COMPRESSOR_BASE = 0x2300;
+
+// Per-channel name write — 0x2400..0x2407, 8-byte ASCII payload (NUL-padded).
+static constexpr uint32_t CMD_WRITE_CHANNEL_NAME_BASE = 0x2400;
+
+// Crossover writes — 0x12000..0x12007 (named symbol; was a bare literal).
+static constexpr uint32_t CMD_WRITE_CROSSOVER_BASE = 0x12000;
+
+// 10-band parametric EQ writes:
+//   cmd = CMD_WRITE_EQ_BAND_BASE + (band << 8) + channel
+//   band = 0..9, channel = 0..7
+// Payload (8 bytes):
+//   [0..1] freq Hz LE16
+//   [2..3] gain raw LE16 (dB = (raw - 600) / 10; same as channel volume)
+//   [4]    bandwidth byte; Q ≈ 256 / b4_byte
+//   [5..7] zeros
+static constexpr uint32_t CMD_WRITE_EQ_BAND_BASE = 0x10000;
+
+// EQ encoding constants
+static constexpr float    EQ_Q_BW_CONSTANT  = 256.0f;
+static constexpr int      EQ_GAIN_RAW_OFFSET = 600;  // same as CHANNEL_VOL_OFFSET
+static constexpr int      EQ_GAIN_RAW_MIN    = 0;     // -60 dB
+static constexpr int      EQ_GAIN_RAW_MAX    = 1200;  // +60 dB envelope
 
 // Master payload constants (decode of byte[0]):
 //     dB = lvl_raw - 60   (0..66 raw = -60..+6 dB)
