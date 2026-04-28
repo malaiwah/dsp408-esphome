@@ -6,23 +6,34 @@ namespace dsp408 {
 
 static const char *const TAG = "dsp408.switch";
 
-void DSP408Switch::dump_config() {
-  if (this->is_master_) {
-    ESP_LOGCONFIG(TAG, "DSP-408 Switch (master mute): '%s'", this->get_name().c_str());
-  } else {
-    ESP_LOGCONFIG(TAG, "DSP-408 Switch (channel %u mute): '%s'",
-                  this->channel_, this->get_name().c_str());
+static const char *kind_name(SwitchKind k) {
+  switch (k) {
+    case SwitchKind::MASTER_MUTE:    return "master mute";
+    case SwitchKind::CHANNEL_MUTE:   return "channel mute";
+    case SwitchKind::CHANNEL_POLAR:  return "channel polar";
   }
+  return "?";
+}
+
+void DSP408Switch::dump_config() {
+  ESP_LOGCONFIG(TAG, "DSP-408 Switch (%s ch=%u): '%s'",
+                kind_name(this->kind_), this->channel_, this->get_name().c_str());
 }
 
 void DSP408Switch::write_state(bool state) {
   if (this->parent_ == nullptr)
     return;
   this->publish_state(state);  // optimistic
-  if (this->is_master_) {
-    this->parent_->request_master_mute(state);
-  } else {
-    this->parent_->request_channel_mute(this->channel_, state);
+  switch (this->kind_) {
+    case SwitchKind::MASTER_MUTE:
+      this->parent_->request_master_mute(state);
+      break;
+    case SwitchKind::CHANNEL_MUTE:
+      this->parent_->request_channel_mute(this->channel_, state);
+      break;
+    case SwitchKind::CHANNEL_POLAR:
+      this->parent_->request_channel_polar(this->channel_, state);
+      break;
   }
 }
 

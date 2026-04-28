@@ -6,12 +6,22 @@
 namespace esphome {
 namespace dsp408 {
 
+enum class SwitchKind : uint8_t {
+  MASTER_MUTE = 0,
+  CHANNEL_MUTE,
+  CHANNEL_POLAR,
+};
+
 class DSP408Switch : public switch_::Switch, public Component {
  public:
   void set_parent(DSP408 *parent) { this->parent_ = parent; }
-  void set_master() { this->is_master_ = true; }
-  void set_channel(uint8_t ch) {
-    this->is_master_ = false;
+  void set_master_mute() { this->kind_ = SwitchKind::MASTER_MUTE; }
+  void set_channel_mute(uint8_t ch) {
+    this->kind_ = SwitchKind::CHANNEL_MUTE;
+    this->channel_ = ch;
+  }
+  void set_channel_polar(uint8_t ch) {
+    this->kind_ = SwitchKind::CHANNEL_POLAR;
     this->channel_ = ch;
   }
 
@@ -22,7 +32,7 @@ class DSP408Switch : public switch_::Switch, public Component {
   void write_state(bool state) override;
 
   DSP408 *parent_{nullptr};
-  bool is_master_{false};
+  SwitchKind kind_{SwitchKind::MASTER_MUTE};
   uint8_t channel_{0};
 };
 

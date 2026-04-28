@@ -1,8 +1,9 @@
 """DSP-408 switch sub-platform.
 
 Kinds:
-  * MASTER_MUTE      -- toggle master mute (off = audible, on = muted)
-  * CHANNEL_MUTE     -- per-output-channel mute (off = audible, on = muted)
+  * MASTER_MUTE      -- toggle master mute
+  * CHANNEL_MUTE     -- per-channel mute
+  * CHANNEL_POLAR    -- per-channel phase invert (180°)
 """
 
 import esphome.codegen as cg
@@ -17,19 +18,23 @@ DEPENDENCIES = ["dsp408"]
 CONF_KIND = "kind"
 KIND_MASTER_MUTE = "MASTER_MUTE"
 KIND_CHANNEL_MUTE = "CHANNEL_MUTE"
+KIND_CHANNEL_POLAR = "CHANNEL_POLAR"
 
 KINDS = {
     KIND_MASTER_MUTE: KIND_MASTER_MUTE,
     KIND_CHANNEL_MUTE: KIND_CHANNEL_MUTE,
+    KIND_CHANNEL_POLAR: KIND_CHANNEL_POLAR,
 }
+
+PER_CHANNEL_KINDS = {KIND_CHANNEL_MUTE, KIND_CHANNEL_POLAR}
 
 DSP408Switch = dsp408_ns.class_("DSP408Switch", switch_.Switch, cg.Component)
 
 
 def _validate(config):
     kind = config[CONF_KIND]
-    if kind == KIND_CHANNEL_MUTE and CONF_CHANNEL not in config:
-        raise cv.Invalid("channel: 0..7 is required for kind: CHANNEL_MUTE")
+    if kind in PER_CHANNEL_KINDS and CONF_CHANNEL not in config:
+        raise cv.Invalid(f"channel: 0..7 is required for kind: {kind}")
     if kind == KIND_MASTER_MUTE and CONF_CHANNEL in config:
         raise cv.Invalid("channel: must NOT be set for kind: MASTER_MUTE")
     return config
@@ -51,10 +56,15 @@ async def to_code(config):
     parent = await cg.get_variable(config[CONF_DSP408_ID])
     var = await switch_.new_switch(config)
     cg.add(var.set_parent(parent))
-    if config[CONF_KIND] == KIND_MASTER_MUTE:
-        cg.add(var.set_master())
+    kind = config[CONF_KIND]
+    if kind == KIND_MASTER_MUTE:
+        cg.add(var.set_master_mute())
         cg.add(parent.set_master_mute_switch(var))
-    else:
+    elif kind == KIND_CHANNEL_MUTE:
         ch = config[CONF_CHANNEL]
-        cg.add(var.set_channel(ch))
+        cg.add(var.set_channel_mute(ch))
         cg.add(parent.set_channel_mute_switch(ch, var))
+    elif kind == KIND_CHANNEL_POLAR:
+        ch = config[CONF_CHANNEL]
+        cg.add(var.set_channel_polar(ch))
+        cg.add(parent.set_channel_polar_switch(ch, var))

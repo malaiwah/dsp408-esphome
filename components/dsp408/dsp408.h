@@ -24,6 +24,8 @@
 
 #include "usb/usb_host.h"
 
+#include "protocol.h"
+
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -51,7 +53,7 @@ struct InReport {
 
 static constexpr size_t IN_QUEUE_SIZE = 16;
 
-// State machine of the connect/identify/master-state probe sequence.
+// State machine of the connect/identify/probe sequence.
 // Driven by loop() reacting to inbound reports + by per-tick timeouts.
 enum class StartupPhase : uint8_t {
   IDLE,                      // not yet usb-connected
@@ -59,6 +61,7 @@ enum class StartupPhase : uint8_t {
   SENT_CONNECT,              // CMD_CONNECT in flight
   SENT_GET_INFO,             // CMD_GET_INFO in flight
   SENT_GET_MASTER,           // CMD_MASTER read in flight
+  WARMUP_CHANNELS,           // sequentially reading channel state 0..7
   RUNNING,                   // steady-state
 };
 
@@ -83,6 +86,18 @@ class DSP408 : public usb_host::USBClient {
   void set_channel_mute_switch(uint8_t ch, switch_::Switch *s) {
     if (ch < 8) this->ch_mute_sw_[ch] = s;
   }
+  void set_channel_delay_number(uint8_t ch, number::Number *n) {
+    if (ch < 8) this->ch_delay_num_[ch] = n;
+  }
+  void set_channel_polar_switch(uint8_t ch, switch_::Switch *s) {
+    if (ch < 8) this->ch_polar_sw_[ch] = s;
+  }
+  void set_channel_hpf_freq_number(uint8_t ch, number::Number *n) {
+    if (ch < 8) this->ch_hpf_freq_num_[ch] = n;
+  }
+  void set_channel_lpf_freq_number(uint8_t ch, number::Number *n) {
+    if (ch < 8) this->ch_lpf_freq_num_[ch] = n;
+  }
 
   // Public command entry points (called from main loop / entity control()).
   // These post an OUT transfer; replies arrive asynchronously and update
@@ -91,6 +106,10 @@ class DSP408 : public usb_host::USBClient {
   void request_master_mute(bool muted);
   void request_channel_volume(uint8_t ch, float db);
   void request_channel_mute(uint8_t ch, bool muted);
+  void request_channel_delay(uint8_t ch, uint16_t samples);
+  void request_channel_polar(uint8_t ch, bool inverted);
+  void request_channel_hpf_freq(uint8_t ch, uint16_t hz);
+  void request_channel_lpf_freq(uint8_t ch, uint16_t hz);
 
  protected:
   // ───────── USB descriptor walk + interface claim ─────────────────────
@@ -118,12 +137,20 @@ class DSP408 : public usb_host::USBClient {
   bool send_get_master_();
   bool send_set_master_(uint8_t lvl_raw, bool muted);
   bool send_set_channel_(uint8_t ch);  // builds payload from ch_state_
+  bool send_read_channel_(uint8_t ch);  // multi-frame 296-byte read
+  bool send_set_crossover_(uint8_t ch);
 
   // ───────── Frame handlers ────────────────────────────────────────────
   void handle_connect_reply_(const uint8_t *payload, size_t len);
   void handle_get_info_reply_(const uint8_t *payload, size_t len);
   void handle_master_reply_(const uint8_t *payload, size_t len, bool is_ack);
   void handle_channel_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len);
+  void handle_channel_state_blob_(uint8_t ch, const uint8_t *blob, size_t len);
+  void handle_crossover_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len);
+
+  // Publish the full set of cached state for one channel to all
+  // attached entities (volume, mute, delay, polar, hpf/lpf).
+  void publish_channel_state_(uint8_t ch);
 
   // ───────── Per-channel cached desired state ──────────────────────────
   // Mirror of dsp408-py's _channel_cache. We only have the WRITE payload
@@ -131,11 +158,21 @@ class DSP408 : public usb_host::USBClient {
   // in v0.1) so we drive the device entirely from this cache and the
   // user's HA inputs.
   struct ChannelState {
-    bool primed = false;       // true once we've gotten user input
-    int16_t db = 0;            // -60..0 dB (in dB whole units; resolution 0.1 dB on wire)
+    bool primed = false;       // true once we've read or written this channel
+    int16_t db = 0;            // -60..0 dB
     bool muted = false;
+    bool polar = false;        // phase invert
     uint16_t delay_samples = 0;
-    uint8_t subidx = 0;        // populated lazily; defaults from CHANNEL_SUBIDX_DEFAULT
+    uint8_t byte_254 = 0;      // semantic unknown; preserve verbatim
+    uint8_t subidx = 0;        // speaker-role byte (blob[255])
+
+    // Crossover (HPF + LPF)
+    uint16_t hpf_freq_hz = 20;     // default lower bound
+    uint8_t hpf_filter = 0;        // 0=BW 1=Bessel 2=LR
+    uint8_t hpf_slope = 8;         // 8 = Off (default)
+    uint16_t lpf_freq_hz = 20000;
+    uint8_t lpf_filter = 0;
+    uint8_t lpf_slope = 8;
   };
   ChannelState ch_state_[8];
 
@@ -173,6 +210,10 @@ class DSP408 : public usb_host::USBClient {
   switch_::Switch *master_mute_sw_ = nullptr;
   number::Number *ch_vol_num_[8] = {};
   switch_::Switch *ch_mute_sw_[8] = {};
+  number::Number *ch_delay_num_[8] = {};
+  switch_::Switch *ch_polar_sw_[8] = {};
+  number::Number *ch_hpf_freq_num_[8] = {};
+  number::Number *ch_lpf_freq_num_[8] = {};
 
   // ───────── Cached master state (from last reply) ─────────────────────
   bool master_known_ = false;
@@ -183,6 +224,40 @@ class DSP408 : public usb_host::USBClient {
   // future firmware has them).
   uint32_t last_master_poll_ms_ = 0;
   static constexpr uint32_t MASTER_POLL_INTERVAL_MS = 5000;
+
+  // ───────── Multi-frame reassembly state ──────────────────────────────
+  // The DSP-408 returns 296-byte payloads (cmd=0x77NN channel-state read)
+  // as a sequence of 64-byte HID reports: the first carries the standard
+  // header + 50 payload bytes (no chk/end), then 4 raw 64-byte
+  // continuation reports until the declared length is satisfied. The
+  // last continuation also carries chk + end + zero-pad after the final
+  // payload byte. We mirror dsp408-py.transport.read_response semantics:
+  // once we see a multi-frame first frame, we treat every subsequent
+  // inbound report as raw payload until 296 bytes have been collected,
+  // then re-dispatch the assembled blob.
+  bool mf_in_progress_ = false;
+  uint32_t mf_cmd_ = 0;
+  uint8_t mf_direction_ = 0;
+  uint8_t mf_category_ = 0;
+  uint16_t mf_declared_len_ = 0;
+  uint16_t mf_collected_len_ = 0;
+  uint8_t mf_header_[10] = {};   // raw[4..14] from first frame for chk validation
+  uint8_t mf_buffer_[CHANNEL_BLOB_SIZE] = {};
+
+  // Warmup channel-read state (inside StartupPhase::WARMUP_CHANNELS).
+  uint8_t warmup_channel_ = 0;   // next channel index to read (0..7)
+
+  // Per-channel read convergence — mirrors dsp408-py's
+  // ``read_channel_state(retry_on_divergence=True)``. The firmware
+  // occasionally emits a 2-byte-shifted variant of the EQ region (and
+  // sometimes worse — bench test Ch6 returned gain=+324 dB / subidx=0x55
+  // i.e. 'U' which is clearly leaked from elsewhere in the blob). We
+  // keep the previous blob's bytes and re-read until two consecutive
+  // reads agree, up to MAX_BLOB_RETRY attempts.
+  static constexpr uint8_t MAX_BLOB_RETRY = 4;
+  uint8_t warmup_attempt_ = 0;
+  bool warmup_have_prev_ = false;
+  uint8_t warmup_prev_blob_[CHANNEL_BLOB_SIZE] = {};
 };
 
 }  // namespace dsp408

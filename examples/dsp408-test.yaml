@@ -1,5 +1,5 @@
-# DSP-408 ESPHome bench-test config.
-# ESP32-S3 with native USB host claiming a directly-attached DSP-408.
+# DSP-408 ESPHome bench-test config — full v0.2 surface.
+# 8 output channels × {volume, mute, delay, polar, HPF, LPF} + master.
 
 substitutions:
   device_name: dsp408-test
@@ -18,30 +18,23 @@ esp32:
     type: esp-idf
     sdkconfig_options:
       # Force the ESP32-S3's internal USB PHY to host mode by routing
-      # the boot ROM console + ESP-IDF console to UART0 (the on-board
-      # UART-USB bridge), NOT to the native USB-Serial-JTAG.
+      # the boot ROM console + ESP-IDF console to UART0.
       CONFIG_ESP_CONSOLE_UART_DEFAULT: y
       CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG: n
       CONFIG_ESP_CONSOLE_USB_CDC: n
       CONFIG_ESP_CONSOLE_NONE: n
 
-# Pull this directory in. For local dev, run esphome from the repo root.
 external_components:
   - source:
       type: local
       path: ../components
 
 logger:
-  level: DEBUG
+  level: VERBOSE
   hardware_uart: UART0
   logs:
-    # Loud-by-default during early bring-up. Drop to INFO once stable.
-    dsp408: VERBOSE
+    dsp408: DEBUG
     usb_host: INFO
-
-# WiFi can be added once the bench-test is happy. For first flash we
-# can run without WiFi (no api: block, no wifi: block) — ESPHome will
-# still happily serial-log over UART0.
 
 api:
   encryption:
@@ -59,7 +52,7 @@ wifi:
 
 captive_portal:
 
-# ─── DSP-408 plumbing ────────────────────────────────────────────────────
+# ─── DSP-408 ────────────────────────────────────────────────────────────
 
 usb_host:
   enable_hubs: false
@@ -71,7 +64,9 @@ text_sensor:
   - platform: dsp408
     dsp408_id: my_dsp
     kind: MODEL
-    name: "DSP-408 Model"
+    name: "Model"
+
+# ─── Master ─────────────────────────────────────────────────────────────
 
 number:
   - platform: dsp408
@@ -79,6 +74,11 @@ number:
     kind: MASTER_VOLUME
     name: "Master Volume"
     unit_of_measurement: "dB"
+    icon: mdi:volume-high
+
+# ─── Per-channel: volume, delay, HPF, LPF ──────────────────────────────
+# Generated for channels 0..7. Names use 1-based indexing for users.
+
   - platform: dsp408
     dsp408_id: my_dsp
     kind: CHANNEL_VOLUME
@@ -87,10 +87,49 @@ number:
     unit_of_measurement: "dB"
   - platform: dsp408
     dsp408_id: my_dsp
+    kind: CHANNEL_DELAY
+    channel: 0
+    name: "Ch1 Delay"
+    unit_of_measurement: "samples"
+    icon: mdi:timer-outline
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_HPF_FREQ
+    channel: 0
+    name: "Ch1 HPF"
+    unit_of_measurement: "Hz"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_LPF_FREQ
+    channel: 0
+    name: "Ch1 LPF"
+    unit_of_measurement: "Hz"
+
+  - platform: dsp408
+    dsp408_id: my_dsp
     kind: CHANNEL_VOLUME
     channel: 1
     name: "Ch2 Volume"
     unit_of_measurement: "dB"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_DELAY
+    channel: 1
+    name: "Ch2 Delay"
+    unit_of_measurement: "samples"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_HPF_FREQ
+    channel: 1
+    name: "Ch2 HPF"
+    unit_of_measurement: "Hz"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_LPF_FREQ
+    channel: 1
+    name: "Ch2 LPF"
+    unit_of_measurement: "Hz"
+
   - platform: dsp408
     dsp408_id: my_dsp
     kind: CHANNEL_VOLUME
@@ -99,16 +138,57 @@ number:
     unit_of_measurement: "dB"
   - platform: dsp408
     dsp408_id: my_dsp
+    kind: CHANNEL_DELAY
+    channel: 2
+    name: "Ch3 Delay"
+    unit_of_measurement: "samples"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_HPF_FREQ
+    channel: 2
+    name: "Ch3 HPF"
+    unit_of_measurement: "Hz"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_LPF_FREQ
+    channel: 2
+    name: "Ch3 LPF"
+    unit_of_measurement: "Hz"
+
+  - platform: dsp408
+    dsp408_id: my_dsp
     kind: CHANNEL_VOLUME
     channel: 3
     name: "Ch4 Volume"
     unit_of_measurement: "dB"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_DELAY
+    channel: 3
+    name: "Ch4 Delay"
+    unit_of_measurement: "samples"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_HPF_FREQ
+    channel: 3
+    name: "Ch4 HPF"
+    unit_of_measurement: "Hz"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_LPF_FREQ
+    channel: 3
+    name: "Ch4 LPF"
+    unit_of_measurement: "Hz"
+
+# ─── Per-channel: mute, polar ──────────────────────────────────────────
 
 switch:
   - platform: dsp408
     dsp408_id: my_dsp
     kind: MASTER_MUTE
     name: "Master Mute"
+    icon: mdi:volume-off
+
   - platform: dsp408
     dsp408_id: my_dsp
     kind: CHANNEL_MUTE
@@ -116,9 +196,23 @@ switch:
     name: "Ch1 Mute"
   - platform: dsp408
     dsp408_id: my_dsp
+    kind: CHANNEL_POLAR
+    channel: 0
+    name: "Ch1 Polar"
+    icon: mdi:sine-wave
+
+  - platform: dsp408
+    dsp408_id: my_dsp
     kind: CHANNEL_MUTE
     channel: 1
     name: "Ch2 Mute"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_POLAR
+    channel: 1
+    name: "Ch2 Polar"
+    icon: mdi:sine-wave
+
   - platform: dsp408
     dsp408_id: my_dsp
     kind: CHANNEL_MUTE
@@ -126,6 +220,19 @@ switch:
     name: "Ch3 Mute"
   - platform: dsp408
     dsp408_id: my_dsp
+    kind: CHANNEL_POLAR
+    channel: 2
+    name: "Ch3 Polar"
+    icon: mdi:sine-wave
+
+  - platform: dsp408
+    dsp408_id: my_dsp
     kind: CHANNEL_MUTE
     channel: 3
     name: "Ch4 Mute"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_POLAR
+    channel: 3
+    name: "Ch4 Polar"
+    icon: mdi:sine-wave

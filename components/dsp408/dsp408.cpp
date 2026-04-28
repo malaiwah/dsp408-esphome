@@ -25,7 +25,11 @@ static const char *cmd_name(uint32_t cmd) {
     case CMD_IDLE_POLL:  return "IDLE_POLL";
     case CMD_PRESET_NAME: return "PRESET_NAME";
     case CMD_STATUS:     return "STATUS";
-    default:             return "?";
+    default:
+      if (cmd >= 0x7700 && cmd <= 0x7707) return "READ_CH";
+      if (cmd >= 0x1F00 && cmd <= 0x1F07) return "WRITE_CH";
+      if (cmd >= 0x12000 && cmd <= 0x12007) return "WRITE_XOVER";
+      return "?";
   }
 }
 
@@ -87,6 +91,10 @@ void DSP408::on_connected() {
 
 void DSP408::on_disconnected() {
   ESP_LOGI(TAG, "USB device disconnected");
+  // Reset multi-frame state so a stale partial blob doesn't confuse a
+  // subsequent re-attach.
+  this->mf_in_progress_ = false;
+  this->mf_collected_len_ = 0;
   if (this->interface_claimed_ && this->ep_in_ != nullptr) {
     usb_host_endpoint_halt(this->device_handle_, this->ep_in_->bEndpointAddress);
     usb_host_endpoint_flush(this->device_handle_, this->ep_in_->bEndpointAddress);
@@ -216,6 +224,7 @@ void DSP408::loop() {
     case StartupPhase::SENT_CONNECT:
     case StartupPhase::SENT_GET_INFO:
     case StartupPhase::SENT_GET_MASTER:
+    case StartupPhase::WARMUP_CHANNELS:
       // Watchdog timeout — if no reply in REQUEST_TIMEOUT_MS, retry the
       // whole startup from CMD_CONNECT.
       if (this->cmd_in_flight_ != 0 &&
@@ -223,6 +232,8 @@ void DSP408::loop() {
         ESP_LOGW(TAG, "Timeout waiting for reply to %s — restarting startup",
                  cmd_name(this->cmd_in_flight_));
         this->cmd_in_flight_ = 0;
+        this->mf_in_progress_ = false;
+        this->mf_collected_len_ = 0;
         this->phase_ = StartupPhase::WAIT_AFTER_CONNECT;
         this->phase_started_ms_ = now;
       }
@@ -259,6 +270,55 @@ void DSP408::process_in_queue_() {
 }
 
 void DSP408::dispatch_frame_(const InReport &report) {
+  // Multi-frame continuation path — when reassembly is in progress, we
+  // expect the next inbound HID report(s) to be RAW continuation bytes
+  // (no DSP-408 header). The Python lib does the same: it stops parsing
+  // headers on continuation reports and just concatenates the next
+  // (declared_len - collected) bytes. The chk + end markers live
+  // in-stream at offset declared_len within the continuation payload
+  // of the LAST continuation report.
+  if (this->mf_in_progress_) {
+    size_t want = this->mf_declared_len_ - this->mf_collected_len_;
+    size_t take = report.length;
+    if (take > want) take = want;
+    memcpy(this->mf_buffer_ + this->mf_collected_len_, report.data, take);
+    this->mf_collected_len_ += take;
+    if (this->mf_collected_len_ >= this->mf_declared_len_) {
+      // Fully collected. Validate checksum (lenient — Python lib doesn't
+      // either; the firmware appears to always emit valid checksums but
+      // we don't gate dispatch on it).
+      uint8_t want_chk = xor_checksum(this->mf_header_, sizeof(this->mf_header_));
+      want_chk ^= xor_checksum(this->mf_buffer_, this->mf_declared_len_);
+      uint8_t got_chk = 0;
+      if (take < report.length)
+        got_chk = report.data[take];
+      else
+        got_chk = 0xFF;  // chk wasn't in this report; we'd need yet another
+      bool chk_ok = (got_chk == want_chk);
+      ESP_LOGV(TAG, "<- multi-frame complete cmd=0x%X len=%u chk=%s",
+               static_cast<unsigned>(this->mf_cmd_), this->mf_declared_len_,
+               chk_ok ? "ok" : "MISMATCH");
+
+      uint32_t cmd = this->mf_cmd_;
+      this->mf_in_progress_ = false;
+      this->mf_collected_len_ = 0;
+
+      // Clear in-flight marker — match the cmd loosely (firmware can
+      // return seq=0 for reads).
+      if (this->cmd_in_flight_ == cmd) this->cmd_in_flight_ = 0;
+
+      // Dispatch the assembled blob.
+      if (cmd >= CMD_READ_CHANNEL_BASE && cmd < CMD_READ_CHANNEL_BASE + 8) {
+        uint8_t ch = static_cast<uint8_t>(cmd - CMD_READ_CHANNEL_BASE);
+        this->handle_channel_state_blob_(ch, this->mf_buffer_, this->mf_declared_len_);
+      } else {
+        ESP_LOGW(TAG, "Multi-frame complete for unhandled cmd 0x%X",
+                 static_cast<unsigned>(cmd));
+      }
+    }
+    return;
+  }
+
   ParsedFrame f = parse_frame(report.data, report.length);
   if (!f.valid) {
     ESP_LOGV(TAG, "Inbound report not a DSP-408 frame (len=%u)", report.length);
@@ -269,14 +329,32 @@ void DSP408::dispatch_frame_(const InReport &report) {
     ESP_LOGV(TAG, "Inbound frame with unexpected direction 0x%02X", f.direction);
     return;
   }
-  ESP_LOGV(TAG, "<- dir=0x%02X cat=0x%02X cmd=0x%X seq=%u len=%u",
-           f.direction, f.category, static_cast<unsigned>(f.cmd), f.seq, f.payload_len);
+  ESP_LOGV(TAG, "<- dir=0x%02X cat=0x%02X cmd=0x%X seq=%u len=%u%s",
+           f.direction, f.category, static_cast<unsigned>(f.cmd), f.seq, f.payload_len,
+           f.is_multi_frame_first ? " (MF)" : "");
 
-  // Match against in-flight cmd. Lenient on seq because firmware sometimes
-  // returns seq=0 even for reads.
-  bool was_in_flight = (this->cmd_in_flight_ == f.cmd);
-  if (was_in_flight)
-    this->cmd_in_flight_ = 0;
+  // Multi-frame first — start reassembly, don't dispatch yet.
+  if (f.is_multi_frame_first) {
+    if (f.payload_len > sizeof(this->mf_buffer_)) {
+      ESP_LOGE(TAG, "Multi-frame declared len=%u exceeds buffer (%u)",
+               f.payload_len, static_cast<unsigned>(sizeof(this->mf_buffer_)));
+      return;
+    }
+    this->mf_in_progress_ = true;
+    this->mf_cmd_ = f.cmd;
+    this->mf_direction_ = f.direction;
+    this->mf_category_ = f.category;
+    this->mf_declared_len_ = f.payload_len;
+    this->mf_collected_len_ = 0;
+    memcpy(this->mf_header_, report.data + 4, sizeof(this->mf_header_));
+    // Copy first chunk of payload (50 bytes for a multi-frame first).
+    memcpy(this->mf_buffer_, f.payload, f.payload_bytes_in_frame);
+    this->mf_collected_len_ = f.payload_bytes_in_frame;
+    return;
+  }
+
+  // Single-frame: clear in-flight then dispatch by cmd.
+  if (this->cmd_in_flight_ == f.cmd) this->cmd_in_flight_ = 0;
 
   switch (f.cmd) {
     case CMD_CONNECT:
@@ -290,15 +368,15 @@ void DSP408::dispatch_frame_(const InReport &report) {
                                  f.direction == DIR_WRITE_ACK);
       break;
     default:
-      // Per-channel write ack? CMD = 0x1F00..0x1F07
       if (f.cmd >= CMD_WRITE_CHANNEL_BASE && f.cmd < CMD_WRITE_CHANNEL_BASE + 8) {
         this->handle_channel_write_ack_(f.cmd, f.payload, f.payload_bytes_in_frame);
+      } else if (f.cmd >= 0x12000 && f.cmd < 0x12008) {
+        this->handle_crossover_write_ack_(f.cmd, f.payload, f.payload_bytes_in_frame);
       } else {
         ESP_LOGV(TAG, "Unhandled cmd 0x%X", static_cast<unsigned>(f.cmd));
       }
       break;
   }
-  (void) was_in_flight;
 }
 
 bool DSP408::send_cmd_(uint8_t direction, uint32_t cmd, uint8_t category,
@@ -350,6 +428,32 @@ bool DSP408::send_set_master_(uint8_t lvl_raw, bool muted) {
   return this->send_cmd_(DIR_WRITE, CMD_MASTER, CAT_STATE, payload, sizeof(payload), 0);
 }
 
+bool DSP408::send_read_channel_(uint8_t ch) {
+  if (ch >= 8) return false;
+  uint32_t cmd = CMD_READ_CHANNEL_BASE + ch;
+  // 8 zero bytes is what the Windows GUI sends as the read payload.
+  uint8_t payload[8] = {0};
+  return this->send_cmd_(DIR_CMD, cmd, CAT_PARAM, payload, sizeof(payload),
+                         this->next_read_seq_++);
+}
+
+bool DSP408::send_set_crossover_(uint8_t ch) {
+  if (ch >= 8) return false;
+  ChannelState &c = this->ch_state_[ch];
+  uint8_t payload[8] = {
+      static_cast<uint8_t>(c.hpf_freq_hz & 0xFF),
+      static_cast<uint8_t>((c.hpf_freq_hz >> 8) & 0xFF),
+      c.hpf_filter,
+      c.hpf_slope,
+      static_cast<uint8_t>(c.lpf_freq_hz & 0xFF),
+      static_cast<uint8_t>((c.lpf_freq_hz >> 8) & 0xFF),
+      c.lpf_filter,
+      c.lpf_slope,
+  };
+  uint32_t cmd = 0x12000 + ch;
+  return this->send_cmd_(DIR_WRITE, cmd, CAT_PARAM, payload, sizeof(payload), 0);
+}
+
 bool DSP408::send_set_channel_(uint8_t ch) {
   if (ch >= 8) return false;
   ChannelState &c = this->ch_state_[ch];
@@ -365,17 +469,21 @@ bool DSP408::send_set_channel_(uint8_t ch) {
   if (delay > CHANNEL_DELAY_MAX) delay = CHANNEL_DELAY_MAX;
 
   uint8_t payload[8] = {
-      static_cast<uint8_t>(c.muted ? 0 : 1),         // [0] enable
-      0x00,                                          // [1] polar
+      static_cast<uint8_t>(c.muted ? 0 : 1),         // [0] enable: 1=audible, 0=muted
+      static_cast<uint8_t>(c.polar ? 1 : 0),         // [1] polar: 1=inverted
       static_cast<uint8_t>(gain_u16 & 0xFF),         // [2..3] gain LE
       static_cast<uint8_t>((gain_u16 >> 8) & 0xFF),
       static_cast<uint8_t>(delay & 0xFF),            // [4..5] delay LE
       static_cast<uint8_t>((delay >> 8) & 0xFF),
-      0x00,                                          // [6] reserved
+      c.byte_254,                                    // [6] preserved verbatim
       subidx,                                        // [7] DSP channel-type
   };
   uint32_t cmd = CMD_WRITE_CHANNEL_BASE + ch;
-  return this->send_cmd_(DIR_WRITE, cmd, CAT_STATE, payload, sizeof(payload), 0);
+  // cmd=0x1F00..0x1F07 is in the parameter range — Python's
+  // ``category_hint()`` returns CAT_PARAM (0x04) for it. The DSP-408
+  // firmware happens to also accept CAT_STATE (0x09) here, but matching
+  // the Windows GUI / Python wire format exactly is more conservative.
+  return this->send_cmd_(DIR_WRITE, cmd, CAT_PARAM, payload, sizeof(payload), 0);
 }
 
 void DSP408::handle_connect_reply_(const uint8_t *payload, size_t len) {
@@ -433,13 +541,139 @@ void DSP408::handle_master_reply_(const uint8_t *payload, size_t len, bool is_ac
   if (this->master_mute_sw_ != nullptr)
     this->master_mute_sw_->publish_state(this->master_muted_);
 
-  if (this->phase_ != StartupPhase::RUNNING) {
-    this->phase_ = StartupPhase::RUNNING;
+  if (this->phase_ == StartupPhase::SENT_GET_MASTER) {
+    // Move on to channel warmup — read each channel's state to drain
+    // the firmware's startup write-drop quirk AND populate our cache
+    // from device truth before any user-driven writes go out.
+    this->phase_ = StartupPhase::WARMUP_CHANNELS;
+    this->warmup_channel_ = 0;
+    this->warmup_attempt_ = 0;
+    this->warmup_have_prev_ = false;
     this->phase_started_ms_ = millis();
-    this->last_master_poll_ms_ = this->phase_started_ms_;
-    ESP_LOGI(TAG, "DSP-408 ready (startup took %u ms)",
-             static_cast<unsigned>(this->phase_started_ms_ - this->connected_at_ms_));
+    if (this->send_read_channel_(this->warmup_channel_)) {
+      ESP_LOGD(TAG, "Warmup: reading channel %u (attempt 1)", this->warmup_channel_);
+    }
   }
+}
+
+void DSP408::handle_channel_state_blob_(uint8_t ch, const uint8_t *blob, size_t len) {
+  if (ch >= 8) return;
+  if (len < CHANNEL_BLOB_SIZE) {
+    ESP_LOGW(TAG, "Channel %u blob too short: %u bytes", ch, static_cast<unsigned>(len));
+    return;
+  }
+
+  // Read-divergence retry — the firmware sometimes emits a 2-byte-shifted
+  // (or worse) variant of the EQ region. dsp408-py's
+  // ``read_channel_state(retry_on_divergence=True)`` re-reads up to
+  // MAX_BLOB_RETRY times, accepting the first blob that agrees with its
+  // predecessor. We mirror that here during the warmup phase. After
+  // warmup we don't re-read, so steady-state operation is unaffected.
+  if (this->phase_ == StartupPhase::WARMUP_CHANNELS && ch == this->warmup_channel_) {
+    bool converged = this->warmup_have_prev_ &&
+                     memcmp(blob, this->warmup_prev_blob_, CHANNEL_BLOB_SIZE) == 0;
+    if (!converged && this->warmup_attempt_ + 1 < MAX_BLOB_RETRY) {
+      // Save this blob and re-read.
+      memcpy(this->warmup_prev_blob_, blob, CHANNEL_BLOB_SIZE);
+      this->warmup_have_prev_ = true;
+      this->warmup_attempt_++;
+      ESP_LOGD(TAG, "Ch%u: read divergence — retry attempt %u",
+               ch, this->warmup_attempt_ + 1);
+      if (!this->send_read_channel_(ch)) {
+        ESP_LOGW(TAG, "Ch%u: failed to submit retry read", ch);
+      }
+      return;
+    }
+    if (!converged) {
+      ESP_LOGW(TAG, "Ch%u: %u attempts did not converge — accepting last blob",
+               ch, MAX_BLOB_RETRY);
+    } else if (this->warmup_attempt_ > 0) {
+      ESP_LOGD(TAG, "Ch%u: converged after %u attempts", ch, this->warmup_attempt_ + 1);
+    }
+  }
+
+  ChannelState &c = this->ch_state_[ch];
+  // Decode the 296-byte blob — offsets verified live by dsp408-py
+  // against Windows GUI captures.
+  uint16_t gain_raw = static_cast<uint16_t>(blob[OFF_GAIN]) |
+                      (static_cast<uint16_t>(blob[OFF_GAIN + 1]) << 8);
+  c.muted = (blob[OFF_MUTE] == 0);    // INVERTED polarity (1 = audible)
+  c.polar = (blob[OFF_POLAR] != 0);
+  // dB from raw: dB = (raw - 600) / 10. Round to nearest int dB.
+  int db_x10 = static_cast<int>(gain_raw) - CHANNEL_VOL_OFFSET;
+  c.db = static_cast<int16_t>((db_x10 + (db_x10 >= 0 ? 5 : -5)) / 10);
+  c.delay_samples = static_cast<uint16_t>(blob[OFF_DELAY]) |
+                    (static_cast<uint16_t>(blob[OFF_DELAY + 1]) << 8);
+  c.byte_254 = blob[OFF_BYTE_254];
+  c.subidx = blob[OFF_SPK_TYPE];
+
+  c.hpf_freq_hz = static_cast<uint16_t>(blob[OFF_HPF_FREQ]) |
+                  (static_cast<uint16_t>(blob[OFF_HPF_FREQ + 1]) << 8);
+  c.hpf_filter = blob[OFF_HPF_FILTER];
+  c.hpf_slope = blob[OFF_HPF_SLOPE];
+  c.lpf_freq_hz = static_cast<uint16_t>(blob[OFF_LPF_FREQ]) |
+                  (static_cast<uint16_t>(blob[OFF_LPF_FREQ + 1]) << 8);
+  c.lpf_filter = blob[OFF_LPF_FILTER];
+  c.lpf_slope = blob[OFF_LPF_SLOPE];
+  c.primed = true;
+
+  ESP_LOGI(TAG,
+           "Ch%u: %+d dB %s%s delay=%u  HPF=%uHz/%u/%u  LPF=%uHz/%u/%u  subidx=0x%02X",
+           ch, c.db, c.muted ? "(muted)" : "(audible)",
+           c.polar ? " (POLAR)" : "", c.delay_samples,
+           c.hpf_freq_hz, c.hpf_filter, c.hpf_slope,
+           c.lpf_freq_hz, c.lpf_filter, c.lpf_slope, c.subidx);
+
+  this->publish_channel_state_(ch);
+
+  // Warmup phase advance.
+  if (this->phase_ == StartupPhase::WARMUP_CHANNELS && ch == this->warmup_channel_) {
+    this->warmup_channel_++;
+    this->warmup_attempt_ = 0;
+    this->warmup_have_prev_ = false;
+    if (this->warmup_channel_ >= 8) {
+      this->phase_ = StartupPhase::RUNNING;
+      uint32_t now = millis();
+      this->last_master_poll_ms_ = now;
+      ESP_LOGI(TAG, "DSP-408 ready (full state read; startup took %u ms)",
+               static_cast<unsigned>(now - this->connected_at_ms_));
+    } else {
+      // Kick off the next channel read.
+      if (!this->send_read_channel_(this->warmup_channel_)) {
+        ESP_LOGW(TAG, "Failed to submit channel %u read", this->warmup_channel_);
+      }
+    }
+  }
+}
+
+void DSP408::handle_crossover_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len) {
+  uint8_t ch = static_cast<uint8_t>(cmd - 0x12000);
+  ESP_LOGD(TAG, "Crossover ch%u write ack (len=%u)", ch, static_cast<unsigned>(len));
+  if (ch < 8) {
+    ChannelState &c = this->ch_state_[ch];
+    if (this->ch_hpf_freq_num_[ch] != nullptr)
+      this->ch_hpf_freq_num_[ch]->publish_state(static_cast<float>(c.hpf_freq_hz));
+    if (this->ch_lpf_freq_num_[ch] != nullptr)
+      this->ch_lpf_freq_num_[ch]->publish_state(static_cast<float>(c.lpf_freq_hz));
+  }
+  (void) payload;
+}
+
+void DSP408::publish_channel_state_(uint8_t ch) {
+  if (ch >= 8) return;
+  ChannelState &c = this->ch_state_[ch];
+  if (this->ch_vol_num_[ch] != nullptr)
+    this->ch_vol_num_[ch]->publish_state(static_cast<float>(c.db));
+  if (this->ch_mute_sw_[ch] != nullptr)
+    this->ch_mute_sw_[ch]->publish_state(c.muted);
+  if (this->ch_delay_num_[ch] != nullptr)
+    this->ch_delay_num_[ch]->publish_state(static_cast<float>(c.delay_samples));
+  if (this->ch_polar_sw_[ch] != nullptr)
+    this->ch_polar_sw_[ch]->publish_state(c.polar);
+  if (this->ch_hpf_freq_num_[ch] != nullptr)
+    this->ch_hpf_freq_num_[ch]->publish_state(static_cast<float>(c.hpf_freq_hz));
+  if (this->ch_lpf_freq_num_[ch] != nullptr)
+    this->ch_lpf_freq_num_[ch]->publish_state(static_cast<float>(c.lpf_freq_hz));
 }
 
 void DSP408::handle_channel_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len) {
@@ -455,44 +689,119 @@ void DSP408::handle_channel_write_ack_(uint32_t cmd, const uint8_t *payload, siz
 }
 
 // ── Public command entry points ─────────────────────────────────────────
+//
+// All request_* entry points gate on ``phase_ == StartupPhase::RUNNING``.
+// During WAIT_AFTER_CONNECT / SENT_CONNECT / SENT_GET_INFO /
+// SENT_GET_MASTER / WARMUP_CHANNELS the per-channel cache is either
+// empty (defaults: 0 dB / unmuted / no polar / 0 delay / HPF=20 Hz /
+// LPF=20 kHz / slope=8 Off) or being populated from device truth. Any
+// write that goes out before warmup finishes will combine the user's
+// new field with stale defaults for every OTHER field — silently
+// clobbering whatever state the device had stored. This is exactly the
+// "fresh-boot HA touch surges channel to 0 dB" hazard documented at
+// length in dsp408-py's _prime_channel_cache (device.py:1248-1279).
+//
+// The gate drops the write with a WARN. HA's optimistic publish_state
+// from the entity's control() handler is left in place — the next
+// periodic master poll (or future channel-state re-poll) will reaffirm
+// the actual device state to HA.
 
 void DSP408::request_master_volume(float db) {
+  if (this->phase_ != StartupPhase::RUNNING || !this->master_known_) {
+    ESP_LOGW(TAG, "Dropping master_volume write — phase=%d master_known=%d",
+             static_cast<int>(this->phase_), this->master_known_);
+    return;
+  }
   int lvl = static_cast<int>(std::round(db + MASTER_LEVEL_OFFSET));
   if (lvl < MASTER_LEVEL_MIN) lvl = MASTER_LEVEL_MIN;
   if (lvl > MASTER_LEVEL_MAX) lvl = MASTER_LEVEL_MAX;
-  bool muted = this->master_known_ ? this->master_muted_ : false;
   this->master_db_ = static_cast<int8_t>(lvl - MASTER_LEVEL_OFFSET);
-  this->master_known_ = true;
-  this->send_set_master_(static_cast<uint8_t>(lvl), muted);
+  this->send_set_master_(static_cast<uint8_t>(lvl), this->master_muted_);
 }
 
 void DSP408::request_master_mute(bool muted) {
-  uint8_t lvl_raw;
-  if (this->master_known_) {
-    lvl_raw = static_cast<uint8_t>(this->master_db_ + MASTER_LEVEL_OFFSET);
-  } else {
-    lvl_raw = MASTER_LEVEL_OFFSET;  // default 0 dB
+  if (this->phase_ != StartupPhase::RUNNING || !this->master_known_) {
+    ESP_LOGW(TAG, "Dropping master_mute write — phase=%d master_known=%d",
+             static_cast<int>(this->phase_), this->master_known_);
+    return;
   }
+  uint8_t lvl_raw = static_cast<uint8_t>(this->master_db_ + MASTER_LEVEL_OFFSET);
   this->master_muted_ = muted;
-  this->master_known_ = true;
   this->send_set_master_(lvl_raw, muted);
 }
 
 void DSP408::request_channel_volume(uint8_t ch, float db) {
   if (ch >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[ch].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u volume write — phase=%d primed=%d",
+             ch, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
+    return;
+  }
   int v = static_cast<int>(std::round(db));
   if (v < -60) v = -60;
   if (v > 0) v = 0;
   this->ch_state_[ch].db = static_cast<int16_t>(v);
-  this->ch_state_[ch].primed = true;
   this->send_set_channel_(ch);
 }
 
 void DSP408::request_channel_mute(uint8_t ch, bool muted) {
   if (ch >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[ch].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u mute write — phase=%d primed=%d",
+             ch, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
+    return;
+  }
   this->ch_state_[ch].muted = muted;
-  this->ch_state_[ch].primed = true;
   this->send_set_channel_(ch);
+}
+
+void DSP408::request_channel_delay(uint8_t ch, uint16_t samples) {
+  if (ch >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[ch].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u delay write — phase=%d primed=%d",
+             ch, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
+    return;
+  }
+  if (samples > CHANNEL_DELAY_MAX) samples = CHANNEL_DELAY_MAX;
+  this->ch_state_[ch].delay_samples = samples;
+  this->send_set_channel_(ch);
+}
+
+void DSP408::request_channel_polar(uint8_t ch, bool inverted) {
+  if (ch >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[ch].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u polar write — phase=%d primed=%d",
+             ch, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
+    return;
+  }
+  this->ch_state_[ch].polar = inverted;
+  this->send_set_channel_(ch);
+}
+
+void DSP408::request_channel_hpf_freq(uint8_t ch, uint16_t hz) {
+  if (ch >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[ch].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u hpf_freq write — phase=%d primed=%d",
+             ch, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
+    return;
+  }
+  if (hz < 10) hz = 10;
+  if (hz > 20000) hz = 20000;
+  this->ch_state_[ch].hpf_freq_hz = hz;
+  this->send_set_crossover_(ch);
+}
+
+void DSP408::request_channel_lpf_freq(uint8_t ch, uint16_t hz) {
+  if (ch >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[ch].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u lpf_freq write — phase=%d primed=%d",
+             ch, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
+    return;
+  }
+  if (hz < 100) hz = 100;
+  if (hz > 22000) hz = 22000;
+  this->ch_state_[ch].lpf_freq_hz = hz;
+  this->send_set_crossover_(ch);
 }
 
 }  // namespace dsp408

@@ -91,6 +91,40 @@ static constexpr uint8_t CHANNEL_SUBIDX_DEFAULT[8] = {
     0x01, 0x02, 0x03, 0x07, 0x08, 0x09, 0x0F, 0x12,
 };
 
+// 296-byte channel-state blob layout (returned by cmd=0x77NN reads).
+// Offsets from dsp408-py/protocol.py — cross-verified against the
+// Windows GUI captures on the dsp408-py reverse-engineering branch.
+static constexpr size_t CHANNEL_BLOB_SIZE = 296;
+static constexpr size_t OFF_MUTE = 248;
+static constexpr size_t OFF_POLAR = 249;
+static constexpr size_t OFF_GAIN = 250;       // u16 LE
+static constexpr size_t OFF_DELAY = 252;      // u16 LE samples
+static constexpr size_t OFF_BYTE_254 = 254;   // semantic unknown
+static constexpr size_t OFF_SPK_TYPE = 255;
+static constexpr size_t OFF_HPF_FREQ = 256;   // u16 LE Hz
+static constexpr size_t OFF_HPF_FILTER = 258; // 0=BW 1=Bessel 2=LR (3=alias)
+static constexpr size_t OFF_HPF_SLOPE = 259;  // 0..7 = 6..48 dB/oct, 8=Off
+static constexpr size_t OFF_LPF_FREQ = 260;
+static constexpr size_t OFF_LPF_FILTER = 262;
+static constexpr size_t OFF_LPF_SLOPE = 263;
+static constexpr size_t OFF_MIXER = 264;      // 8 × u8 (IN1..IN8)
+static constexpr size_t OFF_ALL_PASS_Q = 280; // u16 LE
+static constexpr size_t OFF_ATTACK_MS = 282;  // u16 LE
+static constexpr size_t OFF_RELEASE_MS = 284; // u16 LE
+static constexpr size_t OFF_THRESHOLD = 286;
+static constexpr size_t OFF_LINKGROUP = 287;
+static constexpr size_t OFF_NAME = 288;       // 8 bytes ASCII
+static constexpr size_t NAME_LEN = 8;
+
+// EQ region (offsets 0..79; 10 bands × 8 bytes each)
+static constexpr size_t EQ_BAND_COUNT = 10;
+static constexpr size_t EQ_BAND_STRIDE = 8;
+// Each band:
+//   [0..1]  freq Hz LE16
+//   [2..3]  gain raw LE16  (dB = (raw - 600) / 10)
+//   [4]     bandwidth byte (Q ≈ 256 / b4_byte)
+//   [5..7]  zeros
+
 // XOR checksum over [direction .. last_payload_byte] inclusive.
 inline uint8_t xor_checksum(const uint8_t *data, size_t len) {
   uint8_t c = 0;

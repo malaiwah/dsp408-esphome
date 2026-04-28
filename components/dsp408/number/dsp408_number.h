@@ -6,12 +6,34 @@
 namespace esphome {
 namespace dsp408 {
 
+enum class NumberKind : uint8_t {
+  MASTER_VOLUME = 0,
+  CHANNEL_VOLUME,
+  CHANNEL_DELAY,
+  CHANNEL_HPF_FREQ,
+  CHANNEL_LPF_FREQ,
+};
+
 class DSP408Number : public number::Number, public Component {
  public:
   void set_parent(DSP408 *parent) { this->parent_ = parent; }
-  void set_master() { this->is_master_ = true; }
-  void set_channel(uint8_t ch) {
-    this->is_master_ = false;
+  void set_master_volume() {
+    this->kind_ = NumberKind::MASTER_VOLUME;
+  }
+  void set_channel_volume(uint8_t ch) {
+    this->kind_ = NumberKind::CHANNEL_VOLUME;
+    this->channel_ = ch;
+  }
+  void set_channel_delay(uint8_t ch) {
+    this->kind_ = NumberKind::CHANNEL_DELAY;
+    this->channel_ = ch;
+  }
+  void set_channel_hpf_freq(uint8_t ch) {
+    this->kind_ = NumberKind::CHANNEL_HPF_FREQ;
+    this->channel_ = ch;
+  }
+  void set_channel_lpf_freq(uint8_t ch) {
+    this->kind_ = NumberKind::CHANNEL_LPF_FREQ;
     this->channel_ = ch;
   }
 
@@ -22,7 +44,7 @@ class DSP408Number : public number::Number, public Component {
   void control(float value) override;
 
   DSP408 *parent_{nullptr};
-  bool is_master_{false};
+  NumberKind kind_{NumberKind::MASTER_VOLUME};
   uint8_t channel_{0};
 };
 

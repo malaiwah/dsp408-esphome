@@ -21,3 +21,4 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+tests/test_protocol
