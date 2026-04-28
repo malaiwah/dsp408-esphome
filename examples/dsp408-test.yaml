@@ -1,0 +1,131 @@
+# DSP-408 ESPHome bench-test config.
+# ESP32-S3 with native USB host claiming a directly-attached DSP-408.
+
+substitutions:
+  device_name: dsp408-test
+  friendly_name: "DSP-408 Test"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: "2026.4.0"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # Force the ESP32-S3's internal USB PHY to host mode by routing
+      # the boot ROM console + ESP-IDF console to UART0 (the on-board
+      # UART-USB bridge), NOT to the native USB-Serial-JTAG.
+      CONFIG_ESP_CONSOLE_UART_DEFAULT: y
+      CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG: n
+      CONFIG_ESP_CONSOLE_USB_CDC: n
+      CONFIG_ESP_CONSOLE_NONE: n
+
+# Pull this directory in. For local dev, run esphome from the repo root.
+external_components:
+  - source:
+      type: local
+      path: ../components
+
+logger:
+  level: DEBUG
+  hardware_uart: UART0
+  logs:
+    # Loud-by-default during early bring-up. Drop to INFO once stable.
+    dsp408: VERBOSE
+    usb_host: INFO
+
+# WiFi can be added once the bench-test is happy. For first flash we
+# can run without WiFi (no api: block, no wifi: block) — ESPHome will
+# still happily serial-log over UART0.
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Hotspot"
+
+captive_portal:
+
+# ─── DSP-408 plumbing ────────────────────────────────────────────────────
+
+usb_host:
+  enable_hubs: false
+
+dsp408:
+  id: my_dsp
+
+text_sensor:
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: MODEL
+    name: "DSP-408 Model"
+
+number:
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: MASTER_VOLUME
+    name: "Master Volume"
+    unit_of_measurement: "dB"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_VOLUME
+    channel: 0
+    name: "Ch1 Volume"
+    unit_of_measurement: "dB"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_VOLUME
+    channel: 1
+    name: "Ch2 Volume"
+    unit_of_measurement: "dB"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_VOLUME
+    channel: 2
+    name: "Ch3 Volume"
+    unit_of_measurement: "dB"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_VOLUME
+    channel: 3
+    name: "Ch4 Volume"
+    unit_of_measurement: "dB"
+
+switch:
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: MASTER_MUTE
+    name: "Master Mute"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_MUTE
+    channel: 0
+    name: "Ch1 Mute"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_MUTE
+    channel: 1
+    name: "Ch2 Mute"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_MUTE
+    channel: 2
+    name: "Ch3 Mute"
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: CHANNEL_MUTE
+    channel: 3
+    name: "Ch4 Mute"

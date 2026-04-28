@@ -1,0 +1,62 @@
+# Minimal DSP-408 bench-test — serial log only, no WiFi / API / OTA.
+# Use this for initial bring-up so log output goes to UART0 immediately
+# without any networking dependencies.
+
+substitutions:
+  device_name: dsp408-min
+
+esphome:
+  name: ${device_name}
+  min_version: "2026.4.0"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP_CONSOLE_UART_DEFAULT: y
+      CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG: n
+      CONFIG_ESP_CONSOLE_USB_CDC: n
+      CONFIG_ESP_CONSOLE_NONE: n
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+
+logger:
+  level: DEBUG
+  hardware_uart: UART0
+  logs:
+    dsp408: VERBOSE
+    usb_host: INFO
+
+# Disable the captive portal / wifi defaults — we just want serial.
+# (No wifi:, api:, or ota: block on purpose.)
+
+usb_host:
+  enable_hubs: false
+
+dsp408:
+  id: my_dsp
+
+text_sensor:
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: MODEL
+    name: "DSP-408 Model"
+
+number:
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: MASTER_VOLUME
+    name: "Master Volume"
+    unit_of_measurement: "dB"
+
+switch:
+  - platform: dsp408
+    dsp408_id: my_dsp
+    kind: MASTER_MUTE
+    name: "Master Mute"
