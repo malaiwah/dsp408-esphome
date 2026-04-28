@@ -409,6 +409,13 @@ void DSP408::handle_get_info_reply_(const uint8_t *payload, size_t len) {
 }
 
 void DSP408::handle_master_reply_(const uint8_t *payload, size_t len, bool is_ack) {
+  if (is_ack && len == 0) {
+    // WRITE_ACKs to CMD_MASTER carry no payload — that's normal. Don't
+    // overwrite the cached state from the optimistic-publish path; the
+    // periodic poll will reaffirm it within MASTER_POLL_INTERVAL_MS.
+    ESP_LOGD(TAG, "MASTER write ack");
+    return;
+  }
   if (len < 8) {
     ESP_LOGW(TAG, "MASTER reply too short (%u bytes)", static_cast<unsigned>(len));
     return;
