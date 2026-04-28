@@ -1,0 +1,51 @@
+name: Host-side unit tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build + run protocol tests
+        run: |
+          cd tests
+          make run
+
+  esphome-config-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install ESPHome
+        run: pip install esphome
+
+      - name: Provide stub secrets so config can validate
+        run: |
+          cat > examples/secrets.yaml <<'EOF'
+          wifi_ssid: "ci-stub-ssid"
+          wifi_password: "ci-stub-password-not-real"
+          api_encryption_key: "RDhGRUFCQjAxQUM4MzU5MTAxMTYzNzY4QkE2QjVCRDg="
+          ota_password: "ci-stub-ota"
+          EOF
+
+      - name: Validate dsp408-test.yaml
+        run: |
+          cd examples
+          esphome config dsp408-test.yaml > /dev/null
+
+      - name: Validate dsp408-test-minimal.yaml
+        run: |
+          cd examples
+          esphome config dsp408-test-minimal.yaml > /dev/null

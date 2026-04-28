@@ -44,14 +44,48 @@ void DSP408::setup() {
 
 void DSP408::dump_config() {
   USBClient::dump_config();
+  static const char *const PHASE_NAMES[] = {
+      "IDLE", "WAIT_AFTER_CONNECT", "SENT_CONNECT", "SENT_GET_INFO",
+      "SENT_GET_MASTER", "WARMUP_CHANNELS", "RUNNING",
+  };
+  uint8_t phase_idx = static_cast<uint8_t>(this->phase_);
+  const char *phase_name = (phase_idx < 7) ? PHASE_NAMES[phase_idx] : "?";
+
   ESP_LOGCONFIG(TAG,
                 "  DSP-408\n"
-                "    Interface claimed: %s\n"
-                "    Phase: %d\n"
-                "    Master known: %s (%+d dB, %s)",
-                YESNO(this->interface_claimed_), static_cast<int>(this->phase_),
+                "    Interface claimed: %s (intf=%u)\n"
+                "    EP-IN:  0x%02X (mps=%u)\n"
+                "    EP-OUT: 0x%02X (mps=%u)\n"
+                "    Phase: %s\n"
+                "    Master: %s (%+d dB, %s)\n"
+                "    Preset name: %s\n"
+                "    Master poll interval: %u ms\n"
+                "    Republish stagger: %u ms",
+                YESNO(this->interface_claimed_), this->intf_number_,
+                this->ep_in_ ? this->ep_in_->bEndpointAddress : 0,
+                this->ep_in_ ? this->ep_in_->wMaxPacketSize : 0,
+                this->ep_out_ ? this->ep_out_->bEndpointAddress : 0,
+                this->ep_out_ ? this->ep_out_->wMaxPacketSize : 0,
+                phase_name,
                 YESNO(this->master_known_), this->master_db_,
-                this->master_muted_ ? "muted" : "audible");
+                this->master_muted_ ? "muted" : "audible",
+                this->preset_name_known_ ? this->preset_name_ : "<unknown>",
+                static_cast<unsigned>(MASTER_POLL_INTERVAL_MS),
+                static_cast<unsigned>(REPUBLISH_STAGGER_MS));
+  // Per-channel dump if any state has been read
+  for (uint8_t ch = 0; ch < 8; ch++) {
+    const ChannelState &c = this->ch_state_[ch];
+    if (!c.primed)
+      continue;
+    ESP_LOGCONFIG(TAG,
+                  "    Ch%u: %+.1f dB %s%s name=\"%s\"  HPF=%uHz/F=%u/S=%u  LPF=%uHz/F=%u/S=%u",
+                  ch, static_cast<float>(c.db_x10) / 10.0f,
+                  c.muted ? "(muted)" : "(audible)",
+                  c.polar ? " (POLAR)" : "",
+                  c.name,
+                  c.hpf_freq_hz, c.hpf_filter, c.hpf_slope,
+                  c.lpf_freq_hz, c.lpf_filter, c.lpf_slope);
+  }
 }
 
 void DSP408::on_connected() {
@@ -116,6 +150,7 @@ void DSP408::on_disconnected() {
   this->phase_ = StartupPhase::IDLE;
   this->cmd_in_flight_ = 0;
   this->master_known_ = false;
+  this->snapshot_pending_ch_ = 0xFF;
   USBClient::on_disconnected();
 }
 
@@ -835,6 +870,50 @@ void DSP408::handle_channel_state_blob_(uint8_t ch, const uint8_t *blob, size_t 
 
   this->publish_channel_state_(ch);
 
+  // Snapshot save (read-modify-write): if a snapshot is pending for
+  // this channel, overlay the cached basic-record fields onto the
+  // live blob (preserving EQ region + everything else byte-for-byte)
+  // and submit a multi-frame WRITE to commit to the device's flash.
+  if (this->snapshot_pending_ch_ == ch && this->phase_ == StartupPhase::RUNNING) {
+    uint8_t out_blob[CHANNEL_BLOB_SIZE];
+    memcpy(out_blob, blob, CHANNEL_BLOB_SIZE);  // start from device truth
+    // Overlay basic-record (offsets 248..295) from cache. Any HA-driven
+    // writes since the last warmup are reflected in the cache; this
+    // ensures they're committed to flash via the multi-frame WRITE.
+    out_blob[OFF_MUTE] = c.muted ? 0 : 1;
+    out_blob[OFF_POLAR] = c.polar ? 1 : 0;
+    uint16_t gain_raw = static_cast<uint16_t>(static_cast<int>(c.db_x10) +
+                                              CHANNEL_VOL_OFFSET);
+    out_blob[OFF_GAIN] = gain_raw & 0xFF;
+    out_blob[OFF_GAIN + 1] = (gain_raw >> 8) & 0xFF;
+    out_blob[OFF_DELAY] = c.delay_samples & 0xFF;
+    out_blob[OFF_DELAY + 1] = (c.delay_samples >> 8) & 0xFF;
+    out_blob[OFF_BYTE_254] = c.byte_254;
+    out_blob[OFF_SPK_TYPE] = c.subidx ? c.subidx : CHANNEL_SUBIDX_DEFAULT[ch];
+    out_blob[OFF_HPF_FREQ]     = c.hpf_freq_hz & 0xFF;
+    out_blob[OFF_HPF_FREQ + 1] = (c.hpf_freq_hz >> 8) & 0xFF;
+    out_blob[OFF_HPF_FILTER]   = c.hpf_filter;
+    out_blob[OFF_HPF_SLOPE]    = c.hpf_slope;
+    out_blob[OFF_LPF_FREQ]     = c.lpf_freq_hz & 0xFF;
+    out_blob[OFF_LPF_FREQ + 1] = (c.lpf_freq_hz >> 8) & 0xFF;
+    out_blob[OFF_LPF_FILTER]   = c.lpf_filter;
+    out_blob[OFF_LPF_SLOPE]    = c.lpf_slope;
+    memcpy(out_blob + OFF_MIXER, c.routing_lo, sizeof(c.routing_lo));
+    out_blob[OFF_ALL_PASS_Q]     = c.comp_all_pass_q & 0xFF;
+    out_blob[OFF_ALL_PASS_Q + 1] = (c.comp_all_pass_q >> 8) & 0xFF;
+    out_blob[OFF_ATTACK_MS]      = c.comp_attack_ms & 0xFF;
+    out_blob[OFF_ATTACK_MS + 1]  = (c.comp_attack_ms >> 8) & 0xFF;
+    out_blob[OFF_RELEASE_MS]     = c.comp_release_ms & 0xFF;
+    out_blob[OFF_RELEASE_MS + 1] = (c.comp_release_ms >> 8) & 0xFF;
+    out_blob[OFF_THRESHOLD]      = c.comp_threshold;
+    out_blob[OFF_LINKGROUP]      = c.comp_linkgroup;
+    memcpy(out_blob + OFF_NAME, c.name, NAME_LEN);
+    ESP_LOGI(TAG, "Snapshot save ch%u: writing %u-byte blob (EQ preserved)",
+             ch, static_cast<unsigned>(CHANNEL_BLOB_SIZE));
+    this->send_set_full_channel_state_(ch, out_blob, sizeof(out_blob));
+    this->snapshot_pending_ch_ = 0xFF;
+  }
+
   // Warmup phase advance.
   if (this->phase_ == StartupPhase::WARMUP_CHANNELS && ch == this->warmup_channel_) {
     this->warmup_channel_++;
@@ -1215,43 +1294,19 @@ bool DSP408::request_save_channel_snapshot(uint8_t channel) {
              this->ch_state_[channel].primed);
     return false;
   }
-  // Build a 296-byte blob from cached state. EQ region (offsets 0..79)
-  // we don't track in cache (only blob[248..295] is the per-channel
-  // record we touch), so we leave the EQ region zero. For real preset-
-  // save you'd want to read+merge the live blob's EQ region; for now
-  // this is the v0.4 starting point — see request_full_channel_state
-  // for direct blob writes.
-  ChannelState &c = this->ch_state_[channel];
-  uint8_t blob[CHANNEL_BLOB_SIZE] = {};
-  blob[OFF_MUTE] = c.muted ? 0 : 1;
-  blob[OFF_POLAR] = c.polar ? 1 : 0;
-  uint16_t gain_raw = static_cast<uint16_t>(static_cast<int>(c.db_x10) +
-                                            CHANNEL_VOL_OFFSET);
-  blob[OFF_GAIN] = gain_raw & 0xFF;
-  blob[OFF_GAIN + 1] = (gain_raw >> 8) & 0xFF;
-  blob[OFF_DELAY] = c.delay_samples & 0xFF;
-  blob[OFF_DELAY + 1] = (c.delay_samples >> 8) & 0xFF;
-  blob[OFF_BYTE_254] = c.byte_254;
-  blob[OFF_SPK_TYPE] = c.subidx ? c.subidx : CHANNEL_SUBIDX_DEFAULT[channel];
-  blob[OFF_HPF_FREQ]     = c.hpf_freq_hz & 0xFF;
-  blob[OFF_HPF_FREQ + 1] = (c.hpf_freq_hz >> 8) & 0xFF;
-  blob[OFF_HPF_FILTER]   = c.hpf_filter;
-  blob[OFF_HPF_SLOPE]    = c.hpf_slope;
-  blob[OFF_LPF_FREQ]     = c.lpf_freq_hz & 0xFF;
-  blob[OFF_LPF_FREQ + 1] = (c.lpf_freq_hz >> 8) & 0xFF;
-  blob[OFF_LPF_FILTER]   = c.lpf_filter;
-  blob[OFF_LPF_SLOPE]    = c.lpf_slope;
-  memcpy(blob + OFF_MIXER, c.routing_lo, sizeof(c.routing_lo));
-  blob[OFF_ALL_PASS_Q]     = c.comp_all_pass_q & 0xFF;
-  blob[OFF_ALL_PASS_Q + 1] = (c.comp_all_pass_q >> 8) & 0xFF;
-  blob[OFF_ATTACK_MS]      = c.comp_attack_ms & 0xFF;
-  blob[OFF_ATTACK_MS + 1]  = (c.comp_attack_ms >> 8) & 0xFF;
-  blob[OFF_RELEASE_MS]     = c.comp_release_ms & 0xFF;
-  blob[OFF_RELEASE_MS + 1] = (c.comp_release_ms >> 8) & 0xFF;
-  blob[OFF_THRESHOLD]      = c.comp_threshold;
-  blob[OFF_LINKGROUP]      = c.comp_linkgroup;
-  memcpy(blob + OFF_NAME, c.name, NAME_LEN);
-  return this->send_set_full_channel_state_(channel, blob, sizeof(blob));
+  if (this->snapshot_pending_ch_ != 0xFF) {
+    ESP_LOGW(TAG, "Snapshot already pending (ch=%u); dropping ch=%u request",
+             this->snapshot_pending_ch_, channel);
+    return false;
+  }
+  // Read-modify-write: kick off a fresh channel-state read; once the
+  // blob arrives, handle_channel_state_blob_ sees snapshot_pending_ch_
+  // matches, overlays cached basic-record fields onto the live blob
+  // (preserving EQ region + everything else byte-for-byte), and
+  // submits a multi-frame WRITE.
+  this->snapshot_pending_ch_ = channel;
+  ESP_LOGI(TAG, "Snapshot save ch%u: read-modify-write initiated", channel);
+  return this->send_read_channel_(channel);
 }
 
 // Compressor field-specific setters do read-modify-write via the

@@ -432,6 +432,14 @@ class DSP408 : public usb_host::USBClient {
   uint8_t warmup_attempt_ = 0;
   bool warmup_have_prev_ = false;
   uint8_t warmup_prev_blob_[CHANNEL_BLOB_SIZE] = {};
+
+  // Snapshot save — read-modify-write of a channel's full 296-byte
+  // blob. Set when request_save_channel_snapshot() is called. After
+  // the next channel-state blob arrives for that channel during
+  // RUNNING phase, we build a modified blob (preserving EQ region
+  // from the live read, overlaying cached basic-record fields) and
+  // submit a multi-frame WRITE. 0xFF = none pending.
+  uint8_t snapshot_pending_ch_ = 0xFF;
 };
 
 }  // namespace dsp408

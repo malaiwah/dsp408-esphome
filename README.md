@@ -19,9 +19,10 @@ glue, no USBIP, no Linux client, no kernel HID layer in the path.
 
 ## Status
 
-**v0.4 — beta** (2026-04-28). Validated on an ESP32-S3 DevKitC-1 + a real
+**1.0** (2026-04-28). Validated on an ESP32-S3 DevKitC-1 + a real
 DSP-408 (firmware `MYDW-AV1.06`), driven from a live Home Assistant
-instance over WiFi.
+instance over WiFi. CI for the host-side unit tests + ESPHome config
+validation runs on every push.
 
 | Entity                     | Type          | Range / Notes                                        |
 | -------------------------- | ------------- | ---------------------------------------------------- |
@@ -57,18 +58,12 @@ to 4 attempts) and populates entities from device truth. Writes are
 gated on warmup completion + cache-primed status to prevent the
 "fresh-boot HA touch surges channel to 0 dB" hazard.
 
-### Roadmap to 1.0
+### Future work (post-1.0)
 
 - Bounded request queue for fast slider drag operations (currently
-  the firmware can drop a few mid-flight writes if you whip a slider).
-- Read-modify-write `save_channel_snapshot` so multi-frame WRITEs
-  preserve the EQ region (currently the snapshot leaves blob[0..79]
-  zero, so the device may reject; the underlying multi-frame send
-  path is verified — 5 frames × 64 bytes submit cleanly per the
-  serial trace).
-- ESPHome upstream integration / Hacktoberfest-style PR
-- CI for the host-side unit tests
-- More polish on dump_config, error messages, etc.
+  the firmware can drop a few mid-flight writes if you whip a slider
+  back and forth — most users won't hit this, but it's on the list).
+- Submit upstream as an ESPHome external_component PR.
 
 ## What it looks like booting
 
@@ -236,6 +231,77 @@ ESPHome devices auto-discover via mDNS. After flashing, the DSP-408 shows
 up under **Settings → Devices & Services → Discovered**. Click "Configure",
 paste the API encryption key from your `secrets.yaml`, and HA will
 register all entities automatically.
+
+### HA automation cookbook
+
+A few patterns that come up:
+
+**Crossover for a 2-way (LR @ 2.5 kHz, 24 dB/oct):**
+
+```yaml
+service: number.set_value
+data:
+  entity_id:
+    - number.dsp_408_test_ch1_lpf
+    - number.dsp_408_test_ch2_hpf
+  value: 2500
+---
+service: select.select_option
+data:
+  entity_id:
+    - select.dsp_408_test_ch1_lpf_type
+    - select.dsp_408_test_ch2_hpf_type
+  option: Linkwitz-Riley
+---
+service: select.select_option
+data:
+  entity_id:
+    - select.dsp_408_test_ch1_lpf_slope
+    - select.dsp_408_test_ch2_hpf_slope
+  option: 24 dB/oct
+```
+
+**Time-align a tweeter that's 5 cm closer than the woofer**
+(at 44.1 kHz, 5 cm ≈ 6.5 samples):
+
+```yaml
+service: number.set_value
+data:
+  entity_id: number.dsp_408_test_ch1_delay
+  value: 7  # samples; firmware caps at 359 (≈ 8.143 ms / 277 cm @ 44.1 kHz)
+```
+
+**Set EQ band 5 to a 1 kHz / -3 dB / Q=4 cut on Ch1:**
+
+```yaml
+service: esphome.dsp_408_test_set_eq_band
+data:
+  channel: 0
+  band: 5
+  freq_hz: 1000
+  gain_db: -3.0
+  q: 4.0
+```
+
+**Wire IN1 → Out1 + Out2 (stereo pair from a single mono input):**
+
+```yaml
+service: esphome.dsp_408_test_set_routing
+data: { channel: 0, input_idx: 0, enabled: true }
+---
+service: esphome.dsp_408_test_set_routing
+data: { channel: 1, input_idx: 0, enabled: true }
+```
+
+**Save Ch1 + Ch2 cached state to the device's flash** (read-modify-write):
+
+```yaml
+service: esphome.dsp_408_test_save_channel_snapshot
+data: { channel: 0 }
+---
+service: esphome.dsp_408_test_save_channel_snapshot
+data: { channel: 1 }
+```
 
 ### Practical entity-count ceiling
 
