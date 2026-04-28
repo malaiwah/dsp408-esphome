@@ -74,6 +74,15 @@ api:
                 static_cast<uint8_t>(channel),
                 static_cast<uint8_t>(input_idx),
                 enabled);
+    # Save the cached channel state to the device's flash via the
+    # multi-frame WRITE path (cmd=0x10000+ch, 296-byte payload). The
+    # blob is built from current cache values; EQ region is zeros.
+    - action: save_channel_snapshot
+      variables: { channel: int }
+      then:
+        - lambda: |-
+            id(my_dsp).request_save_channel_snapshot(
+                static_cast<uint8_t>(channel));
 
 ota:
   - platform: esphome
@@ -141,6 +150,13 @@ number:
   - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_HPF_FREQ, channel: 7, name: "Ch8 HPF",    unit_of_measurement: "Hz" }
   - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_LPF_FREQ, channel: 7, name: "Ch8 LPF",    unit_of_measurement: "Hz" }
 
+  # Compressor demo on Ch1 (firmware-inert in v1.06 but writes round-
+  # trip — included to validate the wire format and show the entity
+  # surface).
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_COMP_ATTACK,    channel: 0, name: "Ch1 Comp Attack",    unit_of_measurement: "ms" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_COMP_RELEASE,   channel: 0, name: "Ch1 Comp Release",   unit_of_measurement: "ms" }
+  - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_COMP_THRESHOLD, channel: 0, name: "Ch1 Comp Threshold" }
+
 # ─── Switches (master + per-channel mute/polar) ────────────────────────
 
 switch:
@@ -162,6 +178,10 @@ switch:
   - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_POLAR, channel: 6, name: "Ch7 Polar", icon: mdi:sine-wave }
   - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_MUTE,  channel: 7, name: "Ch8 Mute" }
   - { platform: dsp408, dsp408_id: my_dsp, kind: CHANNEL_POLAR, channel: 7, name: "Ch8 Polar", icon: mdi:sine-wave }
+
+  # Input-side polar (the one firmware-active field on the cat=0x03
+  # plane in v1.06 — verified live). Demoed on Input 1 only.
+  - { platform: dsp408, dsp408_id: my_dsp, kind: INPUT_POLAR, channel: 0, name: "Input 1 Polar", icon: mdi:sine-wave }
 
 # ─── Selects (HPF/LPF type + slope demoed on Ch1 + Ch2) ─────────────────
 

@@ -10,6 +10,7 @@ enum class SwitchKind : uint8_t {
   MASTER_MUTE = 0,
   CHANNEL_MUTE,
   CHANNEL_POLAR,
+  INPUT_POLAR,
 };
 
 class DSP408Switch : public switch_::Switch, public Component {
@@ -23,6 +24,10 @@ class DSP408Switch : public switch_::Switch, public Component {
   void set_channel_polar(uint8_t ch) {
     this->kind_ = SwitchKind::CHANNEL_POLAR;
     this->channel_ = ch;
+  }
+  void set_input_polar(uint8_t input_ch) {
+    this->kind_ = SwitchKind::INPUT_POLAR;
+    this->channel_ = input_ch;
   }
 
   void setup() override {}

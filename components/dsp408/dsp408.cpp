@@ -409,6 +409,21 @@ void DSP408::dispatch_frame_(const InReport &report) {
       } else if (f.cmd >= CMD_WRITE_CHANNEL_NAME_BASE &&
                  f.cmd < CMD_WRITE_CHANNEL_NAME_BASE + 8) {
         this->handle_channel_name_write_ack_(f.cmd, f.payload, f.payload_bytes_in_frame);
+      } else if (f.cmd >= CMD_WRITE_COMPRESSOR_BASE &&
+                 f.cmd < CMD_WRITE_COMPRESSOR_BASE + 8) {
+        ESP_LOGD(TAG, "Compressor ch%u write ack (len=%u)",
+                 static_cast<uint8_t>(f.cmd - CMD_WRITE_COMPRESSOR_BASE),
+                 static_cast<unsigned>(f.payload_bytes_in_frame));
+      } else if (f.cmd >= 0x10000u && f.cmd < 0x10008u) {
+        // Full-channel-state write ACK (cmd=0x10000+ch). Single 0-byte
+        // WRITE_ACK comes after the device finishes consuming all 5
+        // multi-frame continuation reports.
+        ESP_LOGI(TAG, "Full-channel-state ch%u write ack",
+                 static_cast<uint8_t>(f.cmd - 0x10000u));
+      } else if (f.cmd >= 0x0900u && f.cmd < 0x0908u) {
+        // Input MISC (cat=0x03) write ack.
+        ESP_LOGD(TAG, "Input ch%u MISC write ack",
+                 static_cast<uint8_t>(f.cmd - 0x0900u));
       } else {
         ESP_LOGV(TAG, "Unhandled cmd 0x%X", static_cast<unsigned>(f.cmd));
       }
@@ -530,6 +545,98 @@ bool DSP408::send_set_preset_name_(const std::string &name) {
                          payload, sizeof(payload), 0);
 }
 
+bool DSP408::submit_raw_frame_(const uint8_t *frame64) {
+  if (!this->interface_claimed_ || this->ep_out_ == nullptr)
+    return false;
+  auto cb = [](const usb_host::TransferStatus &status) {
+    if (!status.success) {
+      ESP_LOGW(TAG, "raw OUT submit failed status=0x%X", status.error_code);
+    }
+  };
+  return this->transfer_out(this->ep_out_->bEndpointAddress, cb, frame64,
+                            FRAME_SIZE);
+}
+
+bool DSP408::send_set_full_channel_state_(uint8_t ch, const uint8_t *blob,
+                                          size_t blob_len) {
+  if (ch >= 8) return false;
+  if (blob_len != CHANNEL_BLOB_SIZE) {
+    ESP_LOGE(TAG, "set_full_channel_state: expected %u bytes, got %u",
+             static_cast<unsigned>(CHANNEL_BLOB_SIZE),
+             static_cast<unsigned>(blob_len));
+    return false;
+  }
+  // Use the LO-base path (0x10000+ch) — the variant the Windows GUI's
+  // "Load preset from disk" flow emits. cat=CAT_PARAM, dir=a1, seq=0.
+  uint32_t cmd = 0x10000u + ch;
+  uint8_t frames[FRAME_SIZE * 6] = {};  // 5 frames + 1 spill safety
+  size_t n_frames = build_frames_multi(frames, sizeof(frames),
+                                       DIR_WRITE, 0, cmd, CAT_PARAM,
+                                       blob, blob_len);
+  if (n_frames == 0) {
+    ESP_LOGE(TAG, "build_frames_multi returned 0");
+    return false;
+  }
+  ESP_LOGD(TAG, "Multi-frame WRITE ch%u: %u frames, cmd=0x%X",
+           ch, static_cast<unsigned>(n_frames), static_cast<unsigned>(cmd));
+
+  // Submit all frames back-to-back. The device receives them as one
+  // logical packet because the FIRST frame's payload_len header field
+  // declares 296 bytes; the firmware reads continuation reports until
+  // declared length is satisfied.
+  for (size_t i = 0; i < n_frames; i++) {
+    if (!this->submit_raw_frame_(frames + i * FRAME_SIZE)) {
+      ESP_LOGE(TAG, "Multi-frame ch%u submit failed at frame %u",
+               ch, static_cast<unsigned>(i));
+      return false;
+    }
+  }
+  // Track in-flight on the FIRST frame's cmd. Single 0-byte WRITE_ACK
+  // is expected after the LAST frame.
+  this->cmd_in_flight_ = cmd;
+  this->cmd_in_flight_started_ms_ = millis();
+  this->cmd_in_flight_seq_ = 0;
+  this->cmd_in_flight_dir_ = DIR_WRITE;
+  return true;
+}
+
+bool DSP408::send_set_compressor_(uint8_t ch) {
+  if (ch >= 8) return false;
+  ChannelState &c = this->ch_state_[ch];
+  uint8_t payload[8] = {
+      static_cast<uint8_t>(c.comp_all_pass_q & 0xFF),
+      static_cast<uint8_t>((c.comp_all_pass_q >> 8) & 0xFF),
+      static_cast<uint8_t>(c.comp_attack_ms & 0xFF),
+      static_cast<uint8_t>((c.comp_attack_ms >> 8) & 0xFF),
+      static_cast<uint8_t>(c.comp_release_ms & 0xFF),
+      static_cast<uint8_t>((c.comp_release_ms >> 8) & 0xFF),
+      c.comp_threshold,
+      c.comp_linkgroup,
+  };
+  uint32_t cmd = CMD_WRITE_COMPRESSOR_BASE + ch;
+  return this->send_cmd_(DIR_WRITE, cmd, CAT_PARAM, payload, sizeof(payload), 0);
+}
+
+bool DSP408::send_set_input_misc_(uint8_t input_ch) {
+  if (input_ch >= 8) return false;
+  // dsp408-py CMD_WRITE_INPUT_MISC_BASE = 0x0900. Payload layout (per
+  // dsp408-py protocol.py): [feedback, polar, mode, mute, delay_le16,
+  // volume, spare]. We only have polar wired up — write zeros for the
+  // rest. The firmware appears to apply each field independently
+  // (verified for polar live; the others are firmware-inert anyway).
+  InputState &is = this->input_state_[input_ch];
+  uint8_t payload[8] = {
+      0,                                   // feedback
+      static_cast<uint8_t>(is.polar ? 1 : 0),
+      0, 0,                                // mode, mute
+      0, 0,                                // delay LE16
+      0,                                   // volume
+      0,                                   // spare
+  };
+  uint32_t cmd = 0x0900u + input_ch;  // CMD_WRITE_INPUT_MISC_BASE + ch
+  return this->send_cmd_(DIR_WRITE, cmd, CAT_INPUT, payload, sizeof(payload), 0);
+}
+
 bool DSP408::send_set_channel_name_(uint8_t ch, const std::string &name) {
   if (ch >= 8) return false;
   uint8_t payload[8] = {};
@@ -544,8 +651,8 @@ bool DSP408::send_set_channel_(uint8_t ch) {
   ChannelState &c = this->ch_state_[ch];
   uint8_t subidx = c.subidx != 0 ? c.subidx : CHANNEL_SUBIDX_DEFAULT[ch];
 
-  // gain raw = (dB * 10) + 600, clamped to [0..600]
-  int gain = static_cast<int>(c.db) * 10 + CHANNEL_VOL_OFFSET;
+  // gain raw = db_x10 + 600, clamped to [0..600] (= -60..0 dB)
+  int gain = static_cast<int>(c.db_x10) + CHANNEL_VOL_OFFSET;
   if (gain < CHANNEL_VOL_MIN) gain = CHANNEL_VOL_MIN;
   if (gain > CHANNEL_VOL_MAX) gain = CHANNEL_VOL_MAX;
   uint16_t gain_u16 = static_cast<uint16_t>(gain);
@@ -684,9 +791,8 @@ void DSP408::handle_channel_state_blob_(uint8_t ch, const uint8_t *blob, size_t 
                       (static_cast<uint16_t>(blob[OFF_GAIN + 1]) << 8);
   c.muted = (blob[OFF_MUTE] == 0);    // INVERTED polarity (1 = audible)
   c.polar = (blob[OFF_POLAR] != 0);
-  // dB from raw: dB = (raw - 600) / 10. Round to nearest int dB.
-  int db_x10 = static_cast<int>(gain_raw) - CHANNEL_VOL_OFFSET;
-  c.db = static_cast<int16_t>((db_x10 + (db_x10 >= 0 ? 5 : -5)) / 10);
+  // dB×10 from raw: db_x10 = raw - 600. Range -600..0 = -60.0..0.0 dB.
+  c.db_x10 = static_cast<int16_t>(static_cast<int>(gain_raw) - CHANNEL_VOL_OFFSET);
   c.delay_samples = static_cast<uint16_t>(blob[OFF_DELAY]) |
                     (static_cast<uint16_t>(blob[OFF_DELAY + 1]) << 8);
   c.byte_254 = blob[OFF_BYTE_254];
@@ -708,11 +814,21 @@ void DSP408::handle_channel_state_blob_(uint8_t ch, const uint8_t *blob, size_t 
   memcpy(c.name, blob + OFF_NAME, NAME_LEN);
   c.name[NAME_LEN] = '\0';
 
+  // Compressor block (firmware-inert in v1.06 but tracked for parity).
+  c.comp_all_pass_q = static_cast<uint16_t>(blob[OFF_ALL_PASS_Q]) |
+                      (static_cast<uint16_t>(blob[OFF_ALL_PASS_Q + 1]) << 8);
+  c.comp_attack_ms = static_cast<uint16_t>(blob[OFF_ATTACK_MS]) |
+                     (static_cast<uint16_t>(blob[OFF_ATTACK_MS + 1]) << 8);
+  c.comp_release_ms = static_cast<uint16_t>(blob[OFF_RELEASE_MS]) |
+                      (static_cast<uint16_t>(blob[OFF_RELEASE_MS + 1]) << 8);
+  c.comp_threshold = blob[OFF_THRESHOLD];
+  c.comp_linkgroup = blob[OFF_LINKGROUP];
+
   c.primed = true;
 
   ESP_LOGI(TAG,
-           "Ch%u: %+d dB %s%s delay=%u  HPF=%uHz/%u/%u  LPF=%uHz/%u/%u  subidx=0x%02X",
-           ch, c.db, c.muted ? "(muted)" : "(audible)",
+           "Ch%u: %+.1f dB %s%s delay=%u  HPF=%uHz/%u/%u  LPF=%uHz/%u/%u  subidx=0x%02X",
+           ch, static_cast<float>(c.db_x10) / 10.0f, c.muted ? "(muted)" : "(audible)",
            c.polar ? " (POLAR)" : "", c.delay_samples,
            c.hpf_freq_hz, c.hpf_filter, c.hpf_slope,
            c.lpf_freq_hz, c.lpf_filter, c.lpf_slope, c.subidx);
@@ -798,7 +914,7 @@ void DSP408::publish_channel_state_(uint8_t ch) {
   if (ch >= 8) return;
   ChannelState &c = this->ch_state_[ch];
   if (this->ch_vol_num_[ch] != nullptr)
-    this->ch_vol_num_[ch]->publish_state(static_cast<float>(c.db));
+    this->ch_vol_num_[ch]->publish_state(static_cast<float>(c.db_x10) / 10.0f);
   if (this->ch_mute_sw_[ch] != nullptr)
     this->ch_mute_sw_[ch]->publish_state(c.muted);
   if (this->ch_delay_num_[ch] != nullptr)
@@ -825,6 +941,12 @@ void DSP408::publish_channel_state_(uint8_t ch) {
     this->ch_lpf_slope_sel_[ch]->publish_state(SLOPE_NAMES_[c.lpf_slope]);
   if (this->ch_name_text_[ch] != nullptr)
     this->ch_name_text_[ch]->publish_state(std::string(c.name));
+  if (this->ch_comp_attack_num_[ch] != nullptr)
+    this->ch_comp_attack_num_[ch]->publish_state(static_cast<float>(c.comp_attack_ms));
+  if (this->ch_comp_release_num_[ch] != nullptr)
+    this->ch_comp_release_num_[ch]->publish_state(static_cast<float>(c.comp_release_ms));
+  if (this->ch_comp_threshold_num_[ch] != nullptr)
+    this->ch_comp_threshold_num_[ch]->publish_state(static_cast<float>(c.comp_threshold));
 }
 
 void DSP408::handle_channel_write_ack_(uint32_t cmd, const uint8_t *payload, size_t len) {
@@ -832,7 +954,8 @@ void DSP408::handle_channel_write_ack_(uint32_t cmd, const uint8_t *payload, siz
   ESP_LOGD(TAG, "Channel %u write ack (len=%u)", ch, static_cast<unsigned>(len));
   if (ch < 8) {
     if (this->ch_vol_num_[ch] != nullptr)
-      this->ch_vol_num_[ch]->publish_state(static_cast<float>(this->ch_state_[ch].db));
+      this->ch_vol_num_[ch]->publish_state(
+          static_cast<float>(this->ch_state_[ch].db_x10) / 10.0f);
     if (this->ch_mute_sw_[ch] != nullptr)
       this->ch_mute_sw_[ch]->publish_state(this->ch_state_[ch].muted);
   }
@@ -888,10 +1011,11 @@ void DSP408::request_channel_volume(uint8_t ch, float db) {
              ch, static_cast<int>(this->phase_), this->ch_state_[ch].primed);
     return;
   }
-  int v = static_cast<int>(std::round(db));
-  if (v < -60) v = -60;
+  // 0.1 dB resolution: encode as db_x10. Range -600..0.
+  int v = static_cast<int>(std::round(db * 10.0f));
+  if (v < -600) v = -600;
   if (v > 0) v = 0;
-  this->ch_state_[ch].db = static_cast<int16_t>(v);
+  this->ch_state_[ch].db_x10 = static_cast<int16_t>(v);
   this->send_set_channel_(ch);
 }
 
@@ -1070,6 +1194,131 @@ void DSP408::request_channel_name(uint8_t channel, const std::string &name) {
   memset(this->ch_state_[channel].name, 0, sizeof(this->ch_state_[channel].name));
   memcpy(this->ch_state_[channel].name, name.data(), copy_len);
   this->send_set_channel_name_(channel, name);
+}
+
+void DSP408::request_full_channel_state(uint8_t channel, const uint8_t *blob,
+                                        size_t blob_len) {
+  if (channel >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING) {
+    ESP_LOGW(TAG, "Dropping ch%u full-state write — phase=%d", channel,
+             static_cast<int>(this->phase_));
+    return;
+  }
+  this->send_set_full_channel_state_(channel, blob, blob_len);
+}
+
+bool DSP408::request_save_channel_snapshot(uint8_t channel) {
+  if (channel >= 8) return false;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[channel].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u snapshot save — phase=%d primed=%d",
+             channel, static_cast<int>(this->phase_),
+             this->ch_state_[channel].primed);
+    return false;
+  }
+  // Build a 296-byte blob from cached state. EQ region (offsets 0..79)
+  // we don't track in cache (only blob[248..295] is the per-channel
+  // record we touch), so we leave the EQ region zero. For real preset-
+  // save you'd want to read+merge the live blob's EQ region; for now
+  // this is the v0.4 starting point — see request_full_channel_state
+  // for direct blob writes.
+  ChannelState &c = this->ch_state_[channel];
+  uint8_t blob[CHANNEL_BLOB_SIZE] = {};
+  blob[OFF_MUTE] = c.muted ? 0 : 1;
+  blob[OFF_POLAR] = c.polar ? 1 : 0;
+  uint16_t gain_raw = static_cast<uint16_t>(static_cast<int>(c.db_x10) +
+                                            CHANNEL_VOL_OFFSET);
+  blob[OFF_GAIN] = gain_raw & 0xFF;
+  blob[OFF_GAIN + 1] = (gain_raw >> 8) & 0xFF;
+  blob[OFF_DELAY] = c.delay_samples & 0xFF;
+  blob[OFF_DELAY + 1] = (c.delay_samples >> 8) & 0xFF;
+  blob[OFF_BYTE_254] = c.byte_254;
+  blob[OFF_SPK_TYPE] = c.subidx ? c.subidx : CHANNEL_SUBIDX_DEFAULT[channel];
+  blob[OFF_HPF_FREQ]     = c.hpf_freq_hz & 0xFF;
+  blob[OFF_HPF_FREQ + 1] = (c.hpf_freq_hz >> 8) & 0xFF;
+  blob[OFF_HPF_FILTER]   = c.hpf_filter;
+  blob[OFF_HPF_SLOPE]    = c.hpf_slope;
+  blob[OFF_LPF_FREQ]     = c.lpf_freq_hz & 0xFF;
+  blob[OFF_LPF_FREQ + 1] = (c.lpf_freq_hz >> 8) & 0xFF;
+  blob[OFF_LPF_FILTER]   = c.lpf_filter;
+  blob[OFF_LPF_SLOPE]    = c.lpf_slope;
+  memcpy(blob + OFF_MIXER, c.routing_lo, sizeof(c.routing_lo));
+  blob[OFF_ALL_PASS_Q]     = c.comp_all_pass_q & 0xFF;
+  blob[OFF_ALL_PASS_Q + 1] = (c.comp_all_pass_q >> 8) & 0xFF;
+  blob[OFF_ATTACK_MS]      = c.comp_attack_ms & 0xFF;
+  blob[OFF_ATTACK_MS + 1]  = (c.comp_attack_ms >> 8) & 0xFF;
+  blob[OFF_RELEASE_MS]     = c.comp_release_ms & 0xFF;
+  blob[OFF_RELEASE_MS + 1] = (c.comp_release_ms >> 8) & 0xFF;
+  blob[OFF_THRESHOLD]      = c.comp_threshold;
+  blob[OFF_LINKGROUP]      = c.comp_linkgroup;
+  memcpy(blob + OFF_NAME, c.name, NAME_LEN);
+  return this->send_set_full_channel_state_(channel, blob, sizeof(blob));
+}
+
+// Compressor field-specific setters do read-modify-write via the
+// cache: update just the field this setter owns, leave the others as
+// they were on warmup (or last write). The wire format always sends
+// the full 8-byte payload, so without this pattern an attack-only
+// change would zero out release/threshold/linkgroup.
+
+void DSP408::request_compressor_attack(uint8_t channel, uint16_t attack_ms) {
+  if (channel >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[channel].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u compressor.attack — phase=%d primed=%d",
+             channel, static_cast<int>(this->phase_),
+             this->ch_state_[channel].primed);
+    return;
+  }
+  this->ch_state_[channel].comp_attack_ms = attack_ms;
+  this->send_set_compressor_(channel);
+}
+
+void DSP408::request_compressor_release(uint8_t channel, uint16_t release_ms) {
+  if (channel >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[channel].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u compressor.release — phase=%d primed=%d",
+             channel, static_cast<int>(this->phase_),
+             this->ch_state_[channel].primed);
+    return;
+  }
+  this->ch_state_[channel].comp_release_ms = release_ms;
+  this->send_set_compressor_(channel);
+}
+
+void DSP408::request_compressor_threshold(uint8_t channel, uint8_t threshold) {
+  if (channel >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[channel].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u compressor.threshold — phase=%d primed=%d",
+             channel, static_cast<int>(this->phase_),
+             this->ch_state_[channel].primed);
+    return;
+  }
+  this->ch_state_[channel].comp_threshold = threshold;
+  this->send_set_compressor_(channel);
+}
+
+void DSP408::request_compressor_linkgroup(uint8_t channel, uint8_t linkgroup) {
+  if (channel >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING || !this->ch_state_[channel].primed) {
+    ESP_LOGW(TAG, "Dropping ch%u compressor.linkgroup — phase=%d primed=%d",
+             channel, static_cast<int>(this->phase_),
+             this->ch_state_[channel].primed);
+    return;
+  }
+  this->ch_state_[channel].comp_linkgroup = linkgroup;
+  this->send_set_compressor_(channel);
+}
+
+void DSP408::request_input_polar(uint8_t input_channel, bool inverted) {
+  if (input_channel >= 8) return;
+  if (this->phase_ != StartupPhase::RUNNING) {
+    ESP_LOGW(TAG, "Dropping input ch%u polar write — phase=%d", input_channel,
+             static_cast<int>(this->phase_));
+    return;
+  }
+  this->input_state_[input_channel].polar = inverted;
+  this->send_set_input_misc_(input_channel);
+  if (this->input_polar_sw_[input_channel] != nullptr)
+    this->input_polar_sw_[input_channel]->publish_state(inverted);
 }
 
 }  // namespace dsp408

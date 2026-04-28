@@ -12,6 +12,9 @@ enum class NumberKind : uint8_t {
   CHANNEL_DELAY,
   CHANNEL_HPF_FREQ,
   CHANNEL_LPF_FREQ,
+  CHANNEL_COMP_ATTACK,
+  CHANNEL_COMP_RELEASE,
+  CHANNEL_COMP_THRESHOLD,
 };
 
 class DSP408Number : public number::Number, public Component {
@@ -34,6 +37,18 @@ class DSP408Number : public number::Number, public Component {
   }
   void set_channel_lpf_freq(uint8_t ch) {
     this->kind_ = NumberKind::CHANNEL_LPF_FREQ;
+    this->channel_ = ch;
+  }
+  void set_channel_comp_attack(uint8_t ch) {
+    this->kind_ = NumberKind::CHANNEL_COMP_ATTACK;
+    this->channel_ = ch;
+  }
+  void set_channel_comp_release(uint8_t ch) {
+    this->kind_ = NumberKind::CHANNEL_COMP_RELEASE;
+    this->channel_ = ch;
+  }
+  void set_channel_comp_threshold(uint8_t ch) {
+    this->kind_ = NumberKind::CHANNEL_COMP_THRESHOLD;
     this->channel_ = ch;
   }
 

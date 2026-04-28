@@ -8,11 +8,14 @@ static const char *const TAG = "dsp408.number";
 
 static const char *kind_name(NumberKind k) {
   switch (k) {
-    case NumberKind::MASTER_VOLUME:    return "master volume";
-    case NumberKind::CHANNEL_VOLUME:   return "channel volume";
-    case NumberKind::CHANNEL_DELAY:    return "channel delay";
-    case NumberKind::CHANNEL_HPF_FREQ: return "channel HPF freq";
-    case NumberKind::CHANNEL_LPF_FREQ: return "channel LPF freq";
+    case NumberKind::MASTER_VOLUME:        return "master volume";
+    case NumberKind::CHANNEL_VOLUME:       return "channel volume";
+    case NumberKind::CHANNEL_DELAY:        return "channel delay";
+    case NumberKind::CHANNEL_HPF_FREQ:     return "channel HPF freq";
+    case NumberKind::CHANNEL_LPF_FREQ:     return "channel LPF freq";
+    case NumberKind::CHANNEL_COMP_ATTACK:  return "comp attack";
+    case NumberKind::CHANNEL_COMP_RELEASE: return "comp release";
+    case NumberKind::CHANNEL_COMP_THRESHOLD: return "comp threshold";
   }
   return "?";
 }
@@ -44,6 +47,18 @@ void DSP408Number::control(float value) {
     case NumberKind::CHANNEL_LPF_FREQ:
       this->parent_->request_channel_lpf_freq(this->channel_,
                                               static_cast<uint16_t>(value));
+      break;
+    case NumberKind::CHANNEL_COMP_ATTACK:
+      this->parent_->request_compressor_attack(this->channel_,
+                                               static_cast<uint16_t>(value));
+      break;
+    case NumberKind::CHANNEL_COMP_RELEASE:
+      this->parent_->request_compressor_release(this->channel_,
+                                                static_cast<uint16_t>(value));
+      break;
+    case NumberKind::CHANNEL_COMP_THRESHOLD:
+      this->parent_->request_compressor_threshold(this->channel_,
+                                                  static_cast<uint8_t>(value));
       break;
   }
 }

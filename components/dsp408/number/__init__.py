@@ -25,6 +25,9 @@ KIND_CHANNEL_VOLUME = "CHANNEL_VOLUME"
 KIND_CHANNEL_DELAY = "CHANNEL_DELAY"
 KIND_CHANNEL_HPF_FREQ = "CHANNEL_HPF_FREQ"
 KIND_CHANNEL_LPF_FREQ = "CHANNEL_LPF_FREQ"
+KIND_CHANNEL_COMP_ATTACK = "CHANNEL_COMP_ATTACK"
+KIND_CHANNEL_COMP_RELEASE = "CHANNEL_COMP_RELEASE"
+KIND_CHANNEL_COMP_THRESHOLD = "CHANNEL_COMP_THRESHOLD"
 
 KINDS = {
     KIND_MASTER_VOLUME: KIND_MASTER_VOLUME,
@@ -32,11 +35,16 @@ KINDS = {
     KIND_CHANNEL_DELAY: KIND_CHANNEL_DELAY,
     KIND_CHANNEL_HPF_FREQ: KIND_CHANNEL_HPF_FREQ,
     KIND_CHANNEL_LPF_FREQ: KIND_CHANNEL_LPF_FREQ,
+    KIND_CHANNEL_COMP_ATTACK: KIND_CHANNEL_COMP_ATTACK,
+    KIND_CHANNEL_COMP_RELEASE: KIND_CHANNEL_COMP_RELEASE,
+    KIND_CHANNEL_COMP_THRESHOLD: KIND_CHANNEL_COMP_THRESHOLD,
 }
 
 PER_CHANNEL_KINDS = {
     KIND_CHANNEL_VOLUME, KIND_CHANNEL_DELAY,
     KIND_CHANNEL_HPF_FREQ, KIND_CHANNEL_LPF_FREQ,
+    KIND_CHANNEL_COMP_ATTACK, KIND_CHANNEL_COMP_RELEASE,
+    KIND_CHANNEL_COMP_THRESHOLD,
 }
 
 DSP408Number = dsp408_ns.class_("DSP408Number", number.Number, cg.Component)
@@ -68,6 +76,8 @@ async def to_code(config):
     parent = await cg.get_variable(config[CONF_DSP408_ID])
     kind = config[CONF_KIND]
     if kind == KIND_MASTER_VOLUME:
+        # Master volume: firmware encoding is integer dB (1 dB step in
+        # the 8-byte payload). Step 1.0 keeps the slider sensible.
         var = await number.new_number(
             config, min_value=-60.0, max_value=6.0, step=1.0
         )
@@ -75,9 +85,13 @@ async def to_code(config):
         cg.add(var.set_master_volume())
         cg.add(parent.set_master_volume_number(var))
     elif kind == KIND_CHANNEL_VOLUME:
+        # Per-channel volume: firmware encodes raw = (dB×10)+600 in u16,
+        # giving 0.1 dB native resolution. We expose 0.5 dB step in HA
+        # as a UX compromise — finer than 1 dB but coarse enough that
+        # slider drag doesn't generate excessive bus traffic.
         ch = config[CONF_CHANNEL]
         var = await number.new_number(
-            config, min_value=-60.0, max_value=0.0, step=1.0
+            config, min_value=-60.0, max_value=0.0, step=0.5
         )
         cg.add(var.set_parent(parent))
         cg.add(var.set_channel_volume(ch))
@@ -106,3 +120,27 @@ async def to_code(config):
         cg.add(var.set_parent(parent))
         cg.add(var.set_channel_lpf_freq(ch))
         cg.add(parent.set_channel_lpf_freq_number(ch, var))
+    elif kind == KIND_CHANNEL_COMP_ATTACK:
+        ch = config[CONF_CHANNEL]
+        var = await number.new_number(
+            config, min_value=0.0, max_value=2000.0, step=1.0
+        )
+        cg.add(var.set_parent(parent))
+        cg.add(var.set_channel_comp_attack(ch))
+        cg.add(parent.set_channel_comp_attack_number(ch, var))
+    elif kind == KIND_CHANNEL_COMP_RELEASE:
+        ch = config[CONF_CHANNEL]
+        var = await number.new_number(
+            config, min_value=0.0, max_value=10000.0, step=1.0
+        )
+        cg.add(var.set_parent(parent))
+        cg.add(var.set_channel_comp_release(ch))
+        cg.add(parent.set_channel_comp_release_number(ch, var))
+    elif kind == KIND_CHANNEL_COMP_THRESHOLD:
+        ch = config[CONF_CHANNEL]
+        var = await number.new_number(
+            config, min_value=0.0, max_value=255.0, step=1.0
+        )
+        cg.add(var.set_parent(parent))
+        cg.add(var.set_channel_comp_threshold(ch))
+        cg.add(parent.set_channel_comp_threshold_number(ch, var))

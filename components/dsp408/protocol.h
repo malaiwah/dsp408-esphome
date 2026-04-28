@@ -201,6 +201,99 @@ inline bool build_frame(uint8_t *out, uint8_t direction, uint8_t seq, uint32_t c
   return true;
 }
 
+// Build a sequence of 64-byte HID reports for a multi-frame logical
+// payload (when payload_len > 48). Mirrors dsp408-py's
+// build_frames_multi() byte-exactly:
+//
+//   First frame:  header[14] + first_50_bytes_of_payload (no chk/end)
+//   Continuation: 64-byte raw payload chunks
+//   LAST cont:    payload + chk + END_MARKER + zero-pad
+//
+// The chk covers (header[4..14] = 10 bytes) + (full payload bytes).
+//
+// `out` is a flat buffer that receives FRAME_SIZE * num_frames bytes.
+// Returns the number of frames produced (0 on failure). `out_capacity`
+// is the size of the output buffer in bytes; we won't write past it.
+//
+// For the only multi-frame WRITE we currently use (full channel state,
+// 296 bytes), this produces 5 frames = 320 bytes total.
+inline size_t build_frames_multi(uint8_t *out, size_t out_capacity,
+                                 uint8_t direction, uint8_t seq, uint32_t cmd,
+                                 uint8_t category,
+                                 const uint8_t *payload, size_t payload_len) {
+  // Single-frame fast path
+  if (payload_len <= FRAME_SIZE - HEADER_SIZE - 2) {
+    if (out_capacity < FRAME_SIZE) return 0;
+    if (!build_frame(out, direction, seq, cmd, category, payload, payload_len))
+      return 0;
+    return 1;
+  }
+
+  // Multi-frame layout
+  static constexpr size_t MAX_IN_FIRST_MULTI = FRAME_SIZE - HEADER_SIZE;  // 50
+  size_t total_frames = 1;  // first frame
+  // Continuation frame count: ceil((payload_len - 50) / 64)
+  size_t rest = payload_len - MAX_IN_FIRST_MULTI;
+  total_frames += (rest + FRAME_SIZE - 1) / FRAME_SIZE;
+  // Last cont's chk + end may overflow into one more frame if the
+  // last cont was full (rare with our blob sizes; safer to budget).
+  size_t bytes_in_last_cont = rest % FRAME_SIZE;
+  if (bytes_in_last_cont == 0) bytes_in_last_cont = FRAME_SIZE;
+  if (bytes_in_last_cont > FRAME_SIZE - 2) {
+    // Need a spill frame for chk + end
+    total_frames += 1;
+  }
+  if (out_capacity < total_frames * FRAME_SIZE) return 0;
+
+  // Compute chk over header[4..14] + full payload
+  uint8_t chk = 0;
+  // First frame header bytes [4..14] = direction, ver, seq, cat, cmd_le32, len_le16
+  uint8_t hdr_chk_bytes[10] = {
+      direction, PROTO_VERSION, seq, category,
+      static_cast<uint8_t>(cmd & 0xFF),
+      static_cast<uint8_t>((cmd >> 8) & 0xFF),
+      static_cast<uint8_t>((cmd >> 16) & 0xFF),
+      static_cast<uint8_t>((cmd >> 24) & 0xFF),
+      static_cast<uint8_t>(payload_len & 0xFF),
+      static_cast<uint8_t>((payload_len >> 8) & 0xFF),
+  };
+  chk = xor_checksum(hdr_chk_bytes, sizeof(hdr_chk_bytes));
+  chk ^= xor_checksum(payload, payload_len);
+
+  // First frame
+  uint8_t *p = out;
+  std::memset(p, 0, FRAME_SIZE);
+  p[0] = FRAME_MAGIC0; p[1] = FRAME_MAGIC1; p[2] = FRAME_MAGIC2; p[3] = FRAME_MAGIC3;
+  std::memcpy(p + 4, hdr_chk_bytes, sizeof(hdr_chk_bytes));
+  std::memcpy(p + HEADER_SIZE, payload, MAX_IN_FIRST_MULTI);
+  size_t produced_payload = MAX_IN_FIRST_MULTI;
+  p += FRAME_SIZE;
+
+  // Continuation frames
+  while (produced_payload < payload_len) {
+    std::memset(p, 0, FRAME_SIZE);
+    size_t remaining = payload_len - produced_payload;
+    size_t take = remaining > FRAME_SIZE ? FRAME_SIZE : remaining;
+    std::memcpy(p, payload + produced_payload, take);
+    produced_payload += take;
+    if (produced_payload == payload_len) {
+      // This is the last cont frame — append chk + END_MARKER if room
+      if (take + 2 <= FRAME_SIZE) {
+        p[take] = chk;
+        p[take + 1] = END_MARKER;
+      } else {
+        // Spill chk+end into the next frame
+        p += FRAME_SIZE;
+        std::memset(p, 0, FRAME_SIZE);
+        p[0] = chk;
+        p[1] = END_MARKER;
+      }
+    }
+    p += FRAME_SIZE;
+  }
+  return total_frames;
+}
+
 // Parsed view of an inbound 64-byte frame. `payload` points into the
 // caller-owned report buffer — copy it if you need to keep it past the
 // transfer callback's lifetime.

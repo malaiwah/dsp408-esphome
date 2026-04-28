@@ -19,7 +19,7 @@ glue, no USBIP, no Linux client, no kernel HID layer in the path.
 
 ## Status
 
-**v0.3 — beta** (2026-04-28). Validated on an ESP32-S3 DevKitC-1 + a real
+**v0.4 — beta** (2026-04-28). Validated on an ESP32-S3 DevKitC-1 + a real
 DSP-408 (firmware `MYDW-AV1.06`), driven from a live Home Assistant
 instance over WiFi.
 
@@ -29,7 +29,7 @@ instance over WiFi.
 | Master volume              | `number`      | -60..+6 dB, 1 dB step                                |
 | Master mute                | `switch`      | off=audible, on=muted                                |
 | Preset name                | `text`        | 15-byte ASCII, persisted in device flash             |
-| Channel volume × 8         | `number`      | -60..0 dB, 1 dB step                                 |
+| Channel volume × 8         | `number`      | -60..0 dB, **0.5 dB step** (firmware native 0.1 dB)  |
 | Channel mute × 8           | `switch`      | per-output mute                                      |
 | Channel polar × 8          | `switch`      | 180° phase invert                                    |
 | Channel delay × 8          | `number`      | 0..359 samples (≈ 8.143 ms @ 44.1 kHz)               |
@@ -40,8 +40,11 @@ instance over WiFi.
 | Channel LPF type × 8       | `select`      | Butterworth / Bessel / Linkwitz-Riley                |
 | Channel LPF slope × 8      | `select`      | 6..48 dB/oct, plus "Off"                             |
 | Channel name × 8           | `text`        | 8-byte ASCII                                         |
+| Channel compressor × 8     | `number` × 3  | attack ms / release ms / threshold (firmware-inert in v1.06 but writes round-trip) |
+| Input polar × 8            | `switch`      | per-input phase invert (cat=0x03 plane; the one firmware-active input field) |
 | EQ band write              | service       | `set_eq_band(channel, band, freq_hz, gain_db, q)`    |
 | Routing matrix write       | service       | `set_routing(channel, input_idx, enabled)`           |
+| Save channel snapshot      | service       | `save_channel_snapshot(channel)` — multi-frame WRITE of the cached blob (296 B, 5 USB frames) |
 
 EQ (10 bands × 8 channels = 80 cells × 3 fields each) and the routing
 matrix (4 inputs × 8 outputs = 32 cells) are exposed as user-defined
@@ -54,13 +57,18 @@ to 4 attempts) and populates entities from device truth. Writes are
 gated on warmup completion + cache-primed status to prevent the
 "fresh-boot HA touch surges channel to 0 dB" hazard.
 
-### Roadmap to v0.4
+### Roadmap to 1.0
 
-- Compressor / dynamics (firmware-inert in v1.06 — low priority)
-- Input-side processing (cat=0x03 plane)
-- Multi-frame WRITE for `set_full_channel_state` / preset save+load
-- 0.1 dB resolution on per-channel volume
-- Bounded request queue for fast slider drag operations
+- Bounded request queue for fast slider drag operations (currently
+  the firmware can drop a few mid-flight writes if you whip a slider).
+- Read-modify-write `save_channel_snapshot` so multi-frame WRITEs
+  preserve the EQ region (currently the snapshot leaves blob[0..79]
+  zero, so the device may reject; the underlying multi-frame send
+  path is verified — 5 frames × 64 bytes submit cleanly per the
+  serial trace).
+- ESPHome upstream integration / Hacktoberfest-style PR
+- CI for the host-side unit tests
+- More polish on dump_config, error messages, etc.
 
 ## What it looks like booting
 
@@ -332,22 +340,27 @@ cd tests && make run
 Output:
 
 ```
-RUN test_xor_checksum_basic ... OK
-RUN test_constants ... OK
-RUN test_build_frame_get_info ... OK
-RUN test_build_frame_master_write ... OK
-RUN test_build_frame_channel_write ... OK
-RUN test_build_frame_crossover_write ... OK
-RUN test_build_frame_eq_band_write ... OK
-RUN test_build_frame_routing_write ... OK
-RUN test_build_frame_channel_name_write ... OK
-RUN test_build_frame_preset_name_write ... OK
-RUN test_eq_q_encoding ... OK
-RUN test_round_trip_master_read ... OK
-RUN test_round_trip_master_write ... OK
-RUN test_parse_multi_frame_first ... OK
-RUN test_parse_invalid_frames ... OK
-RUN test_build_frame_payload_too_large ... OK
+RUN test_xor_checksum_basic                          ... OK
+RUN test_constants                                   ... OK
+RUN test_build_frame_get_info                        ... OK
+RUN test_build_frame_master_write                    ... OK
+RUN test_build_frame_channel_write                   ... OK
+RUN test_build_frame_crossover_write                 ... OK
+RUN test_build_frame_eq_band_write                   ... OK
+RUN test_build_frame_routing_write                   ... OK
+RUN test_build_frame_channel_name_write              ... OK
+RUN test_build_frame_preset_name_write               ... OK
+RUN test_eq_q_encoding                               ... OK
+RUN test_round_trip_master_read                      ... OK
+RUN test_round_trip_master_write                     ... OK
+RUN test_parse_multi_frame_first                     ... OK
+RUN test_parse_invalid_frames                        ... OK
+RUN test_build_frame_payload_too_large               ... OK
+RUN test_build_frames_multi_channel_state            ... OK
+RUN test_build_frames_multi_single_frame_passthrough ... OK
+RUN test_build_frame_compressor_write                ... OK
+RUN test_build_frame_input_misc_write                ... OK
+RUN test_channel_volume_0_1db_encoding               ... OK
 
 All tests passed.
 ```

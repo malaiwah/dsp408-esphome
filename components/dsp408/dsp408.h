@@ -117,6 +117,22 @@ class DSP408 : public usb_host::USBClient {
     if (ch < 8) this->ch_name_text_[ch] = t;
   }
 
+  // Compressor entities (per output channel).
+  void set_channel_comp_attack_number(uint8_t ch, number::Number *n) {
+    if (ch < 8) this->ch_comp_attack_num_[ch] = n;
+  }
+  void set_channel_comp_release_number(uint8_t ch, number::Number *n) {
+    if (ch < 8) this->ch_comp_release_num_[ch] = n;
+  }
+  void set_channel_comp_threshold_number(uint8_t ch, number::Number *n) {
+    if (ch < 8) this->ch_comp_threshold_num_[ch] = n;
+  }
+
+  // Input-side polar (per input channel).
+  void set_input_polar_switch(uint8_t input_ch, switch_::Switch *s) {
+    if (input_ch < 8) this->input_polar_sw_[input_ch] = s;
+  }
+
   // Public command entry points (called from main loop / entity control()).
   // These post an OUT transfer; replies arrive asynchronously and update
   // entity state.
@@ -145,6 +161,53 @@ class DSP408 : public usb_host::USBClient {
   // most users won't need this).
   void request_routing(uint8_t channel, uint8_t input_idx, bool on);
 
+  // Full per-channel state write — 296-byte multi-frame WRITE via
+  // cmd=0x10000+ch (CAT_PARAM, dir=a1). The payload is the same
+  // 296-byte blob layout as a channel-state read. Used by the
+  // preset-save / "load from disk" flows that the Windows GUI emits.
+  // Caller supplies the blob; we wrap it in the multi-frame frames
+  // and submit them back-to-back. The device acks with a single
+  // 0-byte WRITE_ACK on the same cmd.
+  void request_full_channel_state(uint8_t channel, const uint8_t *blob,
+                                  size_t blob_len);
+
+  // Convenience: build a 296-byte blob from the current cached
+  // ChannelState fields and write it. Returns false if the channel
+  // hasn't been primed yet.
+  //
+  // CAVEAT (v0.4): we don't cache the EQ region (offsets 0..79) so
+  // this snapshot writes ZEROS for all 10 EQ bands. Real preset-save
+  // requires read-modify-write — see the dsp408-py save_preset flow
+  // which reads the live blob, preserves the EQ region, then writes
+  // back. Slated for 1.0; the infrastructure (build_frames_multi +
+  // submit_raw_frame_) is in place for it.
+  bool request_save_channel_snapshot(uint8_t channel);
+
+  // Compressor write — 0x2300+ch, 8-byte payload:
+  //   [0..1] all_pass_q LE16 (firmware default 420)
+  //   [2..3] attack_ms LE16  (default 56)
+  //   [4..5] release_ms LE16 (default 500)
+  //   [6]    threshold        (units uncalibrated)
+  //   [7]    linkgroup_num    (0 = no link)
+  //
+  // NOTE: per dsp408-py docstring this block is INERT in firmware
+  // v1.06 — writes round-trip through cache but no audible effect.
+  // Exposed for protocol parity / future firmware support.
+  //
+  // Field-specific setters do read-modify-write via the cache so
+  // changing one field doesn't clobber the others (the wire format
+  // requires the full 8-byte payload on every write).
+  void request_compressor_attack(uint8_t channel, uint16_t attack_ms);
+  void request_compressor_release(uint8_t channel, uint16_t release_ms);
+  void request_compressor_threshold(uint8_t channel, uint8_t threshold);
+  void request_compressor_linkgroup(uint8_t channel, uint8_t linkgroup);
+
+  // Input-side polar (cat=0x03 plane). DSP-408 firmware v1.06 has
+  // mostly-inert input-side processing, but POLAR is one field that
+  // is firmware-active. Maps to byte[2] of the cmd=0x09NN MISC write
+  // (where NN = input channel 0..7).
+  void request_input_polar(uint8_t input_channel, bool inverted);
+
   // Preset-name read/write (15-byte ASCII in cat=CAT_STATE).
   void request_preset_name(const std::string &name);
 
@@ -171,6 +234,13 @@ class DSP408 : public usb_host::USBClient {
   bool send_cmd_(uint8_t direction, uint32_t cmd, uint8_t category,
                  const uint8_t *payload, size_t payload_len, uint8_t seq);
 
+  // Submit a raw 64-byte HID report. Used by the multi-frame WRITE
+  // path which produces a sequence of frames (first frame + N-1
+  // continuation frames). Doesn't touch cmd_in_flight_; caller is
+  // responsible for tracking the in-flight cmd via the FIRST frame's
+  // header. Returns false if transfer_out submission fails.
+  bool submit_raw_frame_(const uint8_t *frame64);
+
   // Convenience wrappers used by the startup state machine + entity setters.
   bool send_connect_();
   bool send_get_info_();
@@ -185,6 +255,9 @@ class DSP408 : public usb_host::USBClient {
   bool send_set_preset_name_(const std::string &name);
   bool send_get_preset_name_();
   bool send_set_channel_name_(uint8_t ch, const std::string &name);
+  bool send_set_full_channel_state_(uint8_t ch, const uint8_t *blob, size_t len);
+  bool send_set_compressor_(uint8_t ch);
+  bool send_set_input_misc_(uint8_t input_ch);
 
   // ───────── Frame handlers ────────────────────────────────────────────
   void handle_connect_reply_(const uint8_t *payload, size_t len);
@@ -209,7 +282,10 @@ class DSP408 : public usb_host::USBClient {
   // user's HA inputs.
   struct ChannelState {
     bool primed = false;       // true once we've read or written this channel
-    int16_t db = 0;            // -60..0 dB
+    // Volume stored as dB × 10 internally for the wire format's full
+    // 0.1 dB resolution. Range -600..0 = -60.0..0.0 dB. Reverse: float
+    // db = static_cast<float>(db_x10) / 10.0f.
+    int16_t db_x10 = 0;
     bool muted = false;
     bool polar = false;        // phase invert
     uint16_t delay_samples = 0;
@@ -230,8 +306,25 @@ class DSP408 : public usb_host::USBClient {
 
     // 8-byte ASCII channel name (NUL-padded), from blob[288..295].
     char name[9] = {};  // 8 chars + NUL terminator for safe printing
+
+    // Compressor / dynamics block (firmware-inert in v1.06 but tracked
+    // for parity with the wire format). From blob[280..287].
+    uint16_t comp_all_pass_q = 420;
+    uint16_t comp_attack_ms = 56;
+    uint16_t comp_release_ms = 500;
+    uint8_t comp_threshold = 0;
+    uint8_t comp_linkgroup = 0;
   };
   ChannelState ch_state_[8];
+
+  // Input-side state — cat=0x03 plane. Per dsp408-py only POLAR is
+  // firmware-active in v1.06; we track all 8 input channels for write
+  // path parity but don't read them on warmup (would add 8 more
+  // multi-frame reads to startup; defer until users actually need it).
+  struct InputState {
+    bool polar = false;
+  };
+  InputState input_state_[8];
 
   // Preset name (15-byte ASCII, NUL-terminated for safe printing).
   char preset_name_[16] = {};
@@ -281,6 +374,10 @@ class DSP408 : public usb_host::USBClient {
   select::Select *ch_lpf_slope_sel_[8] = {};
   text::Text *preset_name_text_ = nullptr;
   text::Text *ch_name_text_[8] = {};
+  number::Number *ch_comp_attack_num_[8] = {};
+  number::Number *ch_comp_release_num_[8] = {};
+  number::Number *ch_comp_threshold_num_[8] = {};
+  switch_::Switch *input_polar_sw_[8] = {};
 
   // ───────── Cached master state (from last reply) ─────────────────────
   bool master_known_ = false;

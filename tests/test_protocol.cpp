@@ -388,6 +388,160 @@ static void test_eq_q_encoding() {
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Multi-frame WRITE — 296-byte channel-state via cmd=0x10000+ch.
+//
+// Expected layout (from dsp408-py captures):
+//   Frame 0: header[14] + first 50 payload bytes (no chk/end)
+//   Frame 1: 64 raw payload
+//   Frame 2: 64 raw payload
+//   Frame 3: 64 raw payload
+//   Frame 4: last 54 payload bytes + chk + END_MARKER + zero-pad
+//
+// 50 + 64*3 + 54 = 296 ✓
+// ────────────────────────────────────────────────────────────────────────
+
+static void test_build_frames_multi_channel_state() {
+  // Synthetic payload with bytes 0..255 cycling.
+  uint8_t payload[CHANNEL_BLOB_SIZE];
+  for (size_t i = 0; i < sizeof(payload); i++)
+    payload[i] = static_cast<uint8_t>(i & 0xFF);
+
+  uint8_t out[FRAME_SIZE * 6] = {};
+  size_t n = build_frames_multi(out, sizeof(out),
+                                DIR_WRITE, 0, /*cmd=*/0x10000u + 3,
+                                CAT_PARAM, payload, sizeof(payload));
+  assert(n == 5);
+
+  // Frame 0: validate header
+  uint8_t want_hdr[HEADER_SIZE] = {
+      0x80, 0x80, 0x80, 0xEE,
+      0xA1, 0x01, 0x00, 0x04,
+      0x03, 0x00, 0x01, 0x00,  // cmd=0x10003 LE
+      0x28, 0x01,              // payload_len=296=0x0128 LE
+  };
+  assert(eq_bytes(out, want_hdr, HEADER_SIZE, "mf_first_header"));
+  // Frame 0: 50 payload bytes after header
+  assert(eq_bytes(out + HEADER_SIZE, payload, 50, "mf_first_payload"));
+
+  // Frame 1..3: raw 64-byte payload chunks at offsets 50, 114, 178
+  assert(eq_bytes(out + FRAME_SIZE,        payload + 50,  64, "mf_cont1"));
+  assert(eq_bytes(out + FRAME_SIZE * 2,    payload + 114, 64, "mf_cont2"));
+  assert(eq_bytes(out + FRAME_SIZE * 3,    payload + 178, 64, "mf_cont3"));
+
+  // Frame 4 (last cont): 54 payload bytes + chk + end + zero-pad
+  assert(eq_bytes(out + FRAME_SIZE * 4, payload + 242, 54, "mf_last_payload"));
+  // chk = XOR(header[4..14]) ^ XOR(payload[0..295])
+  uint8_t hdr_chk_bytes[10] = {
+      0xA1, 0x01, 0x00, 0x04,
+      0x03, 0x00, 0x01, 0x00,
+      0x28, 0x01,
+  };
+  uint8_t expected_chk = xor_checksum(hdr_chk_bytes, sizeof(hdr_chk_bytes));
+  expected_chk ^= xor_checksum(payload, sizeof(payload));
+  assert(out[FRAME_SIZE * 4 + 54] == expected_chk);
+  assert(out[FRAME_SIZE * 4 + 55] == END_MARKER);
+  // Zero pad
+  for (size_t i = 56; i < FRAME_SIZE; i++)
+    assert(out[FRAME_SIZE * 4 + i] == 0);
+}
+
+// Single-frame fast path: 8-byte payload should produce 1 frame
+// identical to build_frame's output.
+static void test_build_frames_multi_single_frame_passthrough() {
+  uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  uint8_t out_multi[FRAME_SIZE * 2] = {};
+  uint8_t out_single[FRAME_SIZE] = {};
+
+  size_t n = build_frames_multi(out_multi, sizeof(out_multi),
+                                DIR_WRITE, 0, CMD_MASTER, CAT_STATE,
+                                payload, sizeof(payload));
+  assert(n == 1);
+  build_frame(out_single, DIR_WRITE, 0, CMD_MASTER, CAT_STATE,
+              payload, sizeof(payload));
+  assert(eq_bytes(out_multi, out_single, FRAME_SIZE, "single_frame_match"));
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Compressor write — cmd = 0x2300 + ch, 8-byte payload:
+//   [0..1] all_pass_q LE16 (default 420 = 0x01A4)
+//   [2..3] attack_ms LE16  (56 = 0x0038)
+//   [4..5] release_ms LE16 (500 = 0x01F4)
+//   [6]    threshold
+//   [7]    linkgroup
+// ────────────────────────────────────────────────────────────────────────
+
+static void test_build_frame_compressor_write() {
+  // ch=0, defaults: q=420, attack=56, release=500, thresh=0, link=0
+  uint8_t payload[8] = {0xA4, 0x01, 0x38, 0x00, 0xF4, 0x01, 0x00, 0x00};
+  uint8_t out[FRAME_SIZE];
+  bool ok = build_frame(out, DIR_WRITE, 0, CMD_WRITE_COMPRESSOR_BASE + 0,
+                        CAT_PARAM, payload, sizeof(payload));
+  assert(ok);
+
+  uint8_t want_hdr[HEADER_SIZE] = {
+      0x80, 0x80, 0x80, 0xEE,
+      0xA1, 0x01, 0x00, 0x04,
+      0x00, 0x23, 0x00, 0x00,
+      0x08, 0x00,
+  };
+  assert(eq_bytes(out, want_hdr, HEADER_SIZE, "compressor_header"));
+  assert(eq_bytes(out + HEADER_SIZE, payload, 8, "compressor_payload"));
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Input MISC write — cmd = 0x0900 + ch, cat=0x03 (CAT_INPUT).
+// Polar inverted on input ch=2:
+//   payload = [feedback=0, polar=1, mode=0, mute=0, delay_le16=0, vol=0, spare=0]
+//           = [00 01 00 00 00 00 00 00]
+//   cmd     = 0x0902
+// ────────────────────────────────────────────────────────────────────────
+
+static void test_build_frame_input_misc_write() {
+  uint8_t payload[8] = {0, 1, 0, 0, 0, 0, 0, 0};
+  uint8_t out[FRAME_SIZE];
+  bool ok = build_frame(out, DIR_WRITE, 0, /*cmd=*/0x0902u, CAT_INPUT,
+                        payload, sizeof(payload));
+  assert(ok);
+
+  uint8_t want_hdr[HEADER_SIZE] = {
+      0x80, 0x80, 0x80, 0xEE,
+      0xA1, 0x01, 0x00, 0x03,
+      0x02, 0x09, 0x00, 0x00,
+      0x08, 0x00,
+  };
+  assert(eq_bytes(out, want_hdr, HEADER_SIZE, "input_misc_header"));
+  assert(eq_bytes(out + HEADER_SIZE, payload, 8, "input_misc_payload"));
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Per-channel volume 0.1 dB encoding round-trip.
+//   db_x10 ↔ raw: raw = db_x10 + 600.  db = raw - 600 / 10.
+//   For dB=-20.5 → db_x10=-205 → raw=395 = 0x018B
+//   For dB=-0.5  → db_x10=-5   → raw=595 = 0x0253
+// ────────────────────────────────────────────────────────────────────────
+
+static void test_channel_volume_0_1db_encoding() {
+  // Verify the inverse: feed known raw values, decode to db_x10 and back.
+  struct Case {
+    int16_t db_x10;
+    uint16_t raw;
+    float expected_db;
+  } cases[] = {
+      {0,    600, 0.0f},
+      {-5,   595, -0.5f},
+      {-205, 395, -20.5f},
+      {-100, 500, -10.0f},
+      {-600, 0,   -60.0f},
+  };
+  for (const auto &c : cases) {
+    int raw = c.db_x10 + CHANNEL_VOL_OFFSET;
+    assert(raw == c.raw);
+    float db = static_cast<float>(c.db_x10) / 10.0f;
+    assert(db == c.expected_db);
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Constant sanity
 // ────────────────────────────────────────────────────────────────────────
 
@@ -436,6 +590,11 @@ int main() {
   RUN(test_parse_multi_frame_first);
   RUN(test_parse_invalid_frames);
   RUN(test_build_frame_payload_too_large);
+  RUN(test_build_frames_multi_channel_state);
+  RUN(test_build_frames_multi_single_frame_passthrough);
+  RUN(test_build_frame_compressor_write);
+  RUN(test_build_frame_input_misc_write);
+  RUN(test_channel_volume_0_1db_encoding);
   printf("\nAll tests passed.\n");
   return 0;
 }

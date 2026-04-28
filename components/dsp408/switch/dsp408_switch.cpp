@@ -11,6 +11,7 @@ static const char *kind_name(SwitchKind k) {
     case SwitchKind::MASTER_MUTE:    return "master mute";
     case SwitchKind::CHANNEL_MUTE:   return "channel mute";
     case SwitchKind::CHANNEL_POLAR:  return "channel polar";
+    case SwitchKind::INPUT_POLAR:    return "input polar";
   }
   return "?";
 }
@@ -33,6 +34,9 @@ void DSP408Switch::write_state(bool state) {
       break;
     case SwitchKind::CHANNEL_POLAR:
       this->parent_->request_channel_polar(this->channel_, state);
+      break;
+    case SwitchKind::INPUT_POLAR:
+      this->parent_->request_input_polar(this->channel_, state);
       break;
   }
 }
